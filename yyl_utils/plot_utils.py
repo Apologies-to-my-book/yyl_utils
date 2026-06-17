@@ -3,7 +3,9 @@ import matplotlib.font_manager as fm
 import os
 from typing import Union,Iterable
 import pandas as pd
-
+from typing import TYPE_CHECKING
+if TYPE_CHECKING:
+    import numpy as np
 
 class LargeDataSlidePlot:
     def __init__(self, data: np.ndarray, time_stamp: np.ndarray, points_overview: int = 30000,
@@ -18,8 +20,6 @@ class LargeDataSlidePlot:
             window_size: 详细图窗口大小，默认30000点
             figsize: 图形尺寸
         """
-        global np, plt, Slider
-        import numpy as np
         import matplotlib.pyplot as plt
         from matplotlib.widgets import Slider, TextBox
 
@@ -182,9 +182,11 @@ class LargeDataSlidePlot:
         self.fig.canvas.draw_idle()
 
     def show(self):
+        import matplotlib.pyplot as plt
         plt.show()
 
     def close(self):
+        import matplotlib.pyplot as plt
         plt.close()
 
 
@@ -214,6 +216,7 @@ def fast_plot_psd(lfp_data: np.ndarray,
     ValueError: 当输入数据不为1维或psd_unit参数无效时
     """
     from scipy import signal
+    import matplotlib.pyplot as plt
     # 检查输入数据维度
     if len(lfp_data.shape) > 1:
         raise ValueError("输入数据不为1维，请提供单通道LFP数据")
@@ -336,6 +339,7 @@ def set_backend(backend_name='Qt5Agg'):
     os.environ['MPLBACKEND'] = backend_name  # 通过环境变量设置
 
 def set_chinese_font():
+    import matplotlib.pyplot as plt
     # 常见的中文字体名称
     chinese_fonts = ['SimHei', 'Microsoft YaHei', 'KaiTi', 'FangSong', 'SimSun']
     for font in chinese_fonts:

@@ -1,4 +1,8 @@
 from __future__ import annotations
+from typing import TYPE_CHECKING
+if TYPE_CHECKING:
+    from probeinterface import Probe
+    from pathlib import Path
 
 def launch_phy(params_path, conda_env="phy2"):
     """
@@ -18,8 +22,9 @@ def launch_phy(params_path, conda_env="phy2"):
 
 class SpikeSortingPipeline:
     """尖峰排序处理管道类"""
+
     class _OutputPaths:
-        def __init__(self, base_folder:Path) :
+        def __init__(self, base_folder: Path):
             self.base_folder: Path = base_folder
             self.raw_recording_folder = base_folder / 'raw_recording_folder'
             self.preprocessed_recording_folder = base_folder / 'preprocessed_recording_folder'
@@ -34,7 +39,7 @@ class SpikeSortingPipeline:
             self.cell_metrics_path = base_folder / "cell_metrics.joblib"
             self.cell_type_metrics_path = base_folder / "cell_type_metrics.xlsx"
 
-    def __init__(self,input_file:str = r"", output_folder:str = r""):
+    def __init__(self, input_file: str = r"", output_folder: str = r""):
         """
         初始化管道
 
@@ -44,9 +49,7 @@ class SpikeSortingPipeline:
             n_jobs: 并行工作数
         """
 
-        # 使用global声明将这些导入提升为全局
-        global yyl, os, np, pd, traceback, plt, Path, si, spre, \
-            ss, sc, sw, ex, se, Probe, matlab, MATLAB_AVAILABLE, joblib
+        # 只导入必要的轻量级包
         import os
         os.environ['KACHERY_API_KEY'] = 'iGnRNcwk2uPk552dRakTwLScoUS78DIU'
 
@@ -55,14 +58,6 @@ class SpikeSortingPipeline:
         import pandas as pd
         import matplotlib.pyplot as plt
         from pathlib import Path
-        import spikeinterface as si
-        import spikeinterface.preprocessing as spre
-        import spikeinterface.sorters as ss
-        import spikeinterface.curation as sc
-        import spikeinterface.widgets as sw
-        import spikeinterface.exporters as ex
-        import spikeinterface.extractors as se
-        from probeinterface import Probe
         import joblib
         import traceback
 
@@ -71,13 +66,13 @@ class SpikeSortingPipeline:
         self.curation_model_path = r""
         self.output_paths: SpikeSortingPipeline._OutputPaths = self._OutputPaths(Path(output_folder))
 
+        # 检查 MATLAB 是否可用（不实际导入，只做可用性检查）
+        self._matlab_available = False
         try:
             import matlab.engine
-            MATLAB_AVAILABLE = True
+            self._matlab_available = True
         except ImportError:
-            MATLAB_AVAILABLE = False
-
-
+            self._matlab_available = False
 
     @staticmethod
     def get_default_sorting_params(sorter_name):
@@ -131,6 +126,10 @@ class SpikeSortingPipeline:
         Returns:
             probe: 配置好的Probe对象，包含电极几何信息和通道映射
         """
+        # 只在需要时导入 probeinterface
+        from probeinterface import Probe
+        import numpy as np
+
         n = num_channels
         # 如果未提供位置信息，生成默认的线性排列电极位置（间距300um）
         if positions is None:
@@ -145,8 +144,8 @@ class SpikeSortingPipeline:
         return probe
 
     def save_traces_to_recording_file(self, traces, fs, chan_ids, outputpath,
-                            metadata_folder=None, properties=None,
-                            probe: Probe = None ,n_jobs = 1):
+                                      metadata_folder=None, properties=None,
+                                      probe: Probe = None, n_jobs=1):
         """
         保存记录数据到二进制文件
 
@@ -162,6 +161,10 @@ class SpikeSortingPipeline:
         Returns:
             rec_fixed: 保存后的Recording对象
         """
+        # 延迟导入 spikeinterface
+        import spikeinterface as si
+        import yyl_utils as yyl
+
         # 创建NumpyRecording对象，将原始数据转换为SpikeInterface格式
         rec_fixed = si.NumpyRecording(
             traces_list=[traces],
@@ -190,16 +193,18 @@ class SpikeSortingPipeline:
 
         return rec_fixed
 
-
-
-
-    def read_save_plx_file(self, inputpath, outputpath, probe:Probe=None, n_jobs = 1):
+    def read_save_plx_file(self, inputpath, outputpath, probe: Probe = None, n_jobs=1):
         """
         将plx文件转换为二进制文件夹并保存
         Args:
             inputpath: 输入的plx文件路径
             outputpath: 二进制文件夹路径
         """
+        # 延迟导入 spikeinterface
+        import spikeinterface as si
+        import spikeinterface.extractors as se
+        import yyl_utils as yyl
+
         # 提取原始数据
         test_recording = se.read_plexon(inputpath, stream_id='WBC')  # 读plx文件
         # 用同样的通道属性重建recording(plx直接保存会报错)
@@ -225,7 +230,7 @@ class SpikeSortingPipeline:
         rec_fixed.save(folder=outputpath, format="binary", name='plx测试', verbose=True, n_jobs=n_jobs)
         return rec_fixed
 
-    def preprocess_recording(self, input_folder, output_folder_preprocessed, output_folder_whitened=None ,n_jobs = 1):
+    def preprocess_recording(self, input_folder, output_folder_preprocessed, output_folder_whitened=None, n_jobs=1):
         """
         对原始recording进行预处理
 
@@ -234,8 +239,13 @@ class SpikeSortingPipeline:
             output_folder_preprocessed: 进行了其它预处理，白化前的数据
             output_folder_whitened: 白化后的数据(幅值会改变)
         """
+        # 延迟导入 spikeinterface
+        import spikeinterface as si
+        import spikeinterface.preprocessing as spre
+        import yyl_utils as yyl
+
         lsb = 1
-        yyl.check_delete_exists_path([output_folder_preprocessed,])
+        yyl.check_delete_exists_path([output_folder_preprocessed, ])
         raw_recording = si.load(file_or_folder_or_dict=input_folder)
         # 带通滤波
         highpass_recording = spre.filter(recording=raw_recording)
@@ -287,6 +297,11 @@ class SpikeSortingPipeline:
             output_folder: 输出文件夹
             params: 排序参数
         """
+        # 延迟导入 spikeinterface
+        import spikeinterface as si
+        import spikeinterface.sorters as ss
+        import yyl_utils as yyl
+
         # 加载recording
         recording = si.load(input_folder)
 
@@ -312,7 +327,7 @@ class SpikeSortingPipeline:
         sorting = ss.run_sorter(**job_dict)
         return sorting
 
-    def batch_sorting(self, input_folder_list:list[str], output_base_folder, sorter_name, params=None, n_jobs = 1):
+    def batch_sorting(self, input_folder_list: list[str], output_base_folder, sorter_name, params=None, n_jobs=1):
         """
         批量排序
         注意保存的verbose_path路径不能在同一个子文件夹下，必须是不同的倒数第二级文件夹，不然它们的元文件会串起来进而报错
@@ -322,6 +337,11 @@ class SpikeSortingPipeline:
             sorter_name: 排序器名称
             params: 排序参数
         """
+        # 延迟导入 spikeinterface
+        import spikeinterface as si
+        import spikeinterface.sorters as ss
+        import yyl_utils as yyl
+
         if params is None:
             params = self.get_default_sorting_params(sorter_name)
 
@@ -356,7 +376,7 @@ class SpikeSortingPipeline:
         )
         return sortings
 
-    def create_analyzer(self, recording_folder, sorting_folder, output_folder, output_qm_path:None, n_jobs = 1):
+    def create_analyzer(self, recording_folder, sorting_folder, output_folder, output_qm_path: None, n_jobs=1):
         """
         创建排序分析器
 
@@ -366,6 +386,10 @@ class SpikeSortingPipeline:
             output_folder: 输出分析器文件夹
             output_qm_path: 是否保存qm矩阵
         """
+        # 延迟导入 spikeinterface
+        import spikeinterface as si
+        import yyl_utils as yyl
+
         yyl.check_delete_exists_path(output_folder)
 
         # 读取recording和sorting
@@ -399,7 +423,8 @@ class SpikeSortingPipeline:
         analyzer.compute('quality_metrics', n_jobs=n_jobs)
 
         if output_qm_path:
-            (analyzer.extensions['quality_metrics'].data['metrics']).to_excel(self.output_paths.qm_excel_path, index=True)
+            (analyzer.extensions['quality_metrics'].data['metrics']).to_excel(self.output_paths.qm_excel_path,
+                                                                              index=True)
 
         ((analyzer.extensions['template_metrics'].data['metrics']).
          to_excel(self.output_paths.template_metrics_path, index=True))
@@ -412,6 +437,11 @@ class SpikeSortingPipeline:
         :param classify_units: 是否判断细胞类型
         :return: None
         """
+        # 延迟导入 spikeinterface
+        import spikeinterface as si
+        import numpy as np
+        import pandas as pd
+
         def screen_units(df_qm_metrics):
             """
             根据质量指标筛选符合分析条件的神经元单元
@@ -433,14 +463,15 @@ class SpikeSortingPipeline:
                 else:
                     screen_dict["sorting_quality"].append("bad")
             return screen_dict
-        def get_unit_max_channel(sorting_analyzer:si.SortingAnalyzer):
+
+        def get_unit_max_channel(sorting_analyzer):
             """获取所有unit的最大的channel位置"""
             # 获取所有单元的ID
             unit_ids = sorting_analyzer.unit_ids
             # 获取探针上所有触点的物理坐标位置
             positions = sorting_analyzer.get_probe().contact_positions
             # 获取每个单元的物理位置坐标，只取与触点坐标维度相同的列
-            unit_locations = sorting_analyzer.extensions["unit_locations"].get_data()[:,0:positions.shape[-1]]
+            unit_locations = sorting_analyzer.extensions["unit_locations"].get_data()[:, 0:positions.shape[-1]]
             # 获取所有通道的ID
             channel_ids = sorting_analyzer.channel_ids
             # 初始化存储每个单元对应最大通道的列表
@@ -457,6 +488,7 @@ class SpikeSortingPipeline:
             channel_dict = {"unit_ids": unit_ids, "max_channel": unit_channel_ids}
 
             return channel_dict
+
         def get_units_classified(df_qm_metrics, df_template_metrics):
             """
             根据波形特征和放电率对神经元进行分类
@@ -518,7 +550,6 @@ class SpikeSortingPipeline:
         df_renew = pd.DataFrame.from_dict(renew_dict)
         df_renew.to_excel(cell_type_metrics_path)
 
-
     def perform_curation(self, analyzer_folder, model_folder):
         """
         使用大模型进行curation
@@ -527,6 +558,11 @@ class SpikeSortingPipeline:
             analyzer_folder: 分析器文件夹路径
             model_folder: 模型文件夹路径
         """
+        # 延迟导入 spikeinterface
+        import spikeinterface as si
+        import spikeinterface.curation as sc
+        import yyl_utils as yyl
+
         sorting_analyzer = si.load(analyzer_folder)
 
         labels_noise = sc.auto_label_units(
@@ -560,16 +596,22 @@ class SpikeSortingPipeline:
 
         return labels_noise, labels_sua_mua
 
-    def visualize_results(self, analyzer_folder, unit_id=None,fig_folder=None):
+    def visualize_results(self, analyzer_folder, unit_id=None, fig_folder=None):
         """
         可视化结果
         Args:
             analyzer_folder: 分析器文件夹
             unit_id: 特定单元ID（如果为None则显示所有）
         """
+        # 延迟导入 spikeinterface
+        import spikeinterface as si
+        import spikeinterface.widgets as sw
+        import yyl_utils as yyl
+        import matplotlib.pyplot as plt
+
         analyzer = si.load(analyzer_folder)
 
-        if fig_folder :
+        if fig_folder:
             yyl.make_sure_folder_exist(fig_folder)
 
         # 打印基本信息
@@ -639,6 +681,12 @@ class SpikeSortingPipeline:
             analyzer_folder: 分析器文件夹
             output_folder: 输出Phy文件夹
         """
+        # 延迟导入 spikeinterface
+        import spikeinterface as si
+        import spikeinterface.exporters as ex
+        import yyl_utils as yyl
+        import pandas as pd
+
         yyl.check_delete_exists_path(output_folder)
 
         analyzer = si.load(analyzer_folder)
@@ -667,9 +715,17 @@ class SpikeSortingPipeline:
             matlab_function_path: MATLAB函数路径
             output_metrics_path: 输出指标文件路径
         """
-        if not MATLAB_AVAILABLE:
+        # 检查 MATLAB 是否可用（使用实例变量）
+        if not self._matlab_available:
             print("MATLAB引擎不可用，跳过CellExplorer分析")
             return None
+
+        # 延迟导入 matlab（在确认可用之后）
+        import matlab.engine
+        import traceback
+        import yyl_utils as yyl
+        import os
+        import joblib
 
         # 内部MATLAB管道类
         class _MatlabPipeline:
@@ -755,7 +811,7 @@ class SpikeSortingPipeline:
             print(f"MATLAB管道执行失败: {error_msg}")
             return None
 
-    def run_pipeline(self,probe:Probe=None, config=None, traces_config=None, n_jobs = 1):
+    def run_pipeline(self, probe: Probe = None, config=None, traces_config=None, n_jobs=1):
         """
         运行完整的spike sorting处理管道
 
@@ -872,7 +928,7 @@ class SpikeSortingPipeline:
         )
 
         # 可选：运行CellExplorer进行进一步分析
-        if run_cell_explorer and MATLAB_AVAILABLE:
+        if run_cell_explorer and self._matlab_available:
             print("运行CellExplorer...")
             matlab_func_path = self.matlab_func_path
             metrics_path = self.output_paths.cell_metrics_path

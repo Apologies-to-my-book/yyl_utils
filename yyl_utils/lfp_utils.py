@@ -1,5 +1,8 @@
 from __future__ import annotations
-from typing import Iterable,Union
+from typing import Iterable,Union,Tuple
+from typing import TYPE_CHECKING
+if TYPE_CHECKING:
+    from pathlib import Path
 
 
 def fit_log_pink_noise(freqs, psd, fit_range=(1, 40), peak_width_limits=(0.98 * 2, 8),
@@ -55,7 +58,6 @@ def fit_log_pink_noise(freqs, psd, fit_range=(1, 40), peak_width_limits=(0.98 * 
     psd_fit_mask = 10 ** (offset - slope * np.log10(freq_mask))
 
     return freq_mask, psd_mask, psd_fit_mask
-
 
 class SOSFilter:
     """
@@ -447,7 +449,6 @@ class SOSFilter:
         plt.tight_layout()
         plt.show()
 
-
 def calc_band_psd_by_simpson(f, psd, band: Iterable[Union[float, int]]):
     """
     使用辛普森积分法计算指定频率范围内的功率谱密度积分值,算出来的结果和nfft无关
@@ -766,20 +767,6 @@ class RippleDetector:
                     html_path: HTML文件保存的文件夹的路径
                     figure_name: 图形名称'阈值图'
                 """
-
-        global np,pd,signal,gaussian_filter,os,go,gc,Tuple,Path,yyl
-        import numpy as np
-        import pandas as pd
-        from scipy import signal
-        from scipy.ndimage import gaussian_filter
-        import os
-        import plotly.graph_objects as go
-        import gc
-        from typing import Tuple
-        from pathlib import Path
-        import yyl_utils as yyl
-
-
         self.fs=1000
 
         # 带通滤波参数
@@ -850,6 +837,7 @@ class RippleDetector:
         :param raw_data:
         :return: 返回高斯包络
         """
+        from scipy.ndimage import gaussian_filter
         data_envelope = np.abs(signal.hilbert(raw_data))
         data_gauss_envelope = gaussian_filter(data_envelope,
               sigma=self.gauss_sigma, truncate=self.gauss_truncate)
@@ -884,6 +872,7 @@ class RippleDetector:
             :param half_window_len:
             :return:返回与输入序列等长的滑动平均后的序列，以及每个点上的std值
             """
+            import pandas as pd
             envelope_values_series = pd.Series(envelope_values)
             window_mean = envelope_values_series.rolling(2 * half_window_len + 1, min_periods=1,
                                                          center=True).mean()
@@ -1072,7 +1061,8 @@ class RippleDetector:
             file_name: 输出文件的基础名称
             epoches_ripple: 检测到的波纹事件时段列表，每个元素为[start, end]格式
         """
-
+        import os
+        import gc
         # 画交互式图
         def create_interactive_ripple_plot_with_lines(ripple_line, idx, envelope_line,
                                                       threshold_high_sd_line, threshold_low_sd_line, output_file):
@@ -1087,6 +1077,7 @@ class RippleDetector:
                 threshold_low_sd_line: 低阈值线数据
                 output_file: 输出的HTML文件名
             """
+            import plotly.graph_objects as go
             # 创建主波纹信号轨迹
             trace1 = go.Scatter(
                 x=np.arange(len(ripple_line)),
