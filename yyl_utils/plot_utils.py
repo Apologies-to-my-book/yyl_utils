@@ -9,7 +9,7 @@ if TYPE_CHECKING:
 
 class LargeDataSlidePlot:
     def __init__(self, data: np.ndarray, time_stamp: np.ndarray, points_overview: int = 30000,
-                 window_size: int = 10000, figsize=(14, 8)):
+                 window_size: int = 10000, figsize=(12, 6)):
         """
         大数据滑动绘图类
 
@@ -21,71 +21,103 @@ class LargeDataSlidePlot:
             figsize: 图形尺寸
         """
         import matplotlib.pyplot as plt
-        from matplotlib.widgets import Slider, TextBox
+        from matplotlib.widgets import Slider, TextBox, Button
+        import numpy as np
 
         self.data = data
         self.time_stamp = time_stamp
+        self.fs = np.mean(np.diff(self.time_stamp))
+        self.window_size = window_size
+        self.current_position = 0
+        self.ylim = (-0.4, 0.4)  # 默认Y轴范围
+
         self.fig = plt.figure(figsize=figsize)
 
-        # 创建两个子图：上方用于概览，下方用于详细显示
-        # 坐标参数: [左边距, 底边距, 宽度, 高度] (相对坐标0-1)
-        self.ax_overview = plt.axes([0.1, 0.7, 0.8, 0.2])  # 上方概览图
-        self.ax_detail = plt.axes([0.1, 0.1, 0.8, 0.5])  # 下方详细图
+        # 使用 GridSpec 划分上下图区域（高度比 1:2 或 1:3）
+        gs = self.fig.add_gridspec(2, 1, height_ratios=[1, 2], hspace=0.35,
+                                   left=0.08, right=0.92, top=0.95, bottom=0.12)
 
-        # 初始参数
-        self.window_size = window_size  # 详细图显示的数据点数
-        self.current_position = 0  # 当前显示的数据起始位置
+        self.ax_overview = self.fig.add_subplot(gs[0])
+        self.ax_detail = self.fig.add_subplot(gs[1])
+        # 取消显示科学计数法
+        import matplotlib.ticker as ticker
+        for ax in [self.ax_overview, self.ax_detail]:
+            # X轴
+            formatter_x = ticker.ScalarFormatter(useOffset=False)
+            formatter_x.set_scientific(False)
+            ax.xaxis.set_major_formatter(formatter_x)
+            # Y轴
+            formatter_y = ticker.ScalarFormatter(useOffset=False)
+            formatter_y.set_scientific(False)
+            ax.yaxis.set_major_formatter(formatter_y)
 
-        # 绘制概览图 - 显示数据的整体趋势
+        # 概览图（降采样）
         self.ax_overview.plot(
-            self.resample_data(self.time_stamp, points_overview),  # 降采样时间戳
-            self.resample_data(self.data, points_overview),  # 降采样数据
-            'g', alpha=0.7, linewidth=0.5  # 黑色细线，半透明
+            self.resample_data(self.time_stamp, points_overview),
+            self.resample_data(self.data, points_overview),
+            'g', alpha=0.7, linewidth=0.5
         )
-        self.ax_overview.set_title('overview_figure')
-        self.ax_overview.set_ylabel("value")
-        self.ax_overview.set_xlabel("time_stamp")
+        self.ax_overview.set_title('overview')
+        self.ax_overview.set_ylabel('value')
+        self.ax_overview.set_ylim(-0.5, 0.5)  # 设置概览图Y轴范围
+        # 只在上方图显示 x 轴标签，下方图也显示也不冲突，
+        # 但为了简洁可只在一个地方显示或都不显示
+        # self.ax_overview.set_xlabel('')
 
-        # 绘制详细图 - 显示当前窗口的详细数据
-        # 保存Line2D对象引用，便于后续更新
+        # 详细图初始线
+        end = self.current_position + self.window_size
         self.detail_line, = self.ax_detail.plot(
-            self.time_stamp[self.current_position:self.current_position + self.window_size],  # 当前窗口的时间戳
-            self.data[self.current_position:self.current_position + self.window_size],  # 当前窗口的数据
-            'r', linewidth=1  # 绿色细线
+            self.time_stamp[self.current_position:end],
+            self.data[self.current_position:end],
+            'r', linewidth=1
         )
-        self.ax_detail.set_title('detail_figure')
+        self.ax_detail.set_ylim(self.ylim)
+        self.ax_detail.set_title('detail')
         self.ax_detail.set_xlabel('time_stamp')
-        self.ax_detail.set_ylabel("value")
+        self.ax_detail.set_ylabel('value')
 
-        # 创建滑块 - 用于控制详细图的显示位置
-        self.slider_ax = plt.axes([0.1, 0.02, 0.8, 0.03])  # 滑块位置
-        self.slider = Slider(
-            self.slider_ax,  # 滑块放置的坐标轴
-            'positions',  # 滑块标签
-            0,  # 最小值
-            len(data) - self.window_size - 1,  # 最大值（防止数组越界）
-            valinit=self.current_position,  # 初始值
-            valfmt='%d'  # 显示格式：整数
-        )
-        self.slider.on_changed(self.on_slider_change)  # 绑定滑块变化回调函数
+        # 滑块和按钮
+        slider_ax = self.fig.add_axes([0.15, 0.02, 0.65, 0.03])
+        self.slider = Slider(slider_ax, 'Position', 0,
+                             len(data) - self.window_size - 1,
+                             valinit=self.current_position, valfmt='%d')
+        self.slider.on_changed(self.on_slider_change)
 
-        # 添加文本框输入 - 用于直接输入位置
-        self.textbox_ax = plt.axes([0.95, 0.05, 0.04, 0.02])  # 文本框位置
-        self.textbox = TextBox(
-            self.textbox_ax,
-            'jump: ',
-            initial=str(self.current_position)
-        )
-        self.textbox.on_submit(self.on_text_submit)  # 绑定文本框提交事件
+        # 左按钮（后退）
+        btn_left_ax = self.fig.add_axes([0.08, 0.02, 0.04, 0.03])
+        self.btn_left = Button(btn_left_ax, '<')
 
-        # 在概览图上添加位置标记 - 显示当前详细图在整体数据中的位置
+        # 右按钮（前进）
+        btn_right_ax = self.fig.add_axes([0.82, 0.02, 0.04, 0.03])
+        self.btn_right = Button(btn_right_ax, '>')
+
+        # 按钮长按相关
+        self.press_timer = None
+        self.press_direction = 0
+        self.step_size = 2*int(1/self.fs)
+        self.btn_left_ax = btn_left_ax
+        self.btn_right_ax = btn_right_ax
+        self.fig.canvas.mpl_connect('button_press_event', self.on_mouse_press)
+        self.fig.canvas.mpl_connect('button_release_event', self.on_mouse_release)
+
+        # 文本框
+        textbox_ax = self.fig.add_axes([0.92, 0.05, 0.06, 0.03])
+        self.textbox = TextBox(textbox_ax, 'Jump: ',
+                               initial=str(self.current_position))
+        self.textbox.on_submit(self.on_text_submit)
+
+        ylim_ax = self.fig.add_axes([0.92, 0.09, 0.06, 0.03])
+        self.ylim_textbox = TextBox(ylim_ax, 'YLim: ', initial=f'{self.ylim[0]},{self.ylim[1]}')
+        self.ylim_textbox.on_submit(self.on_ylim_submit)
+
+        # 概览图上的位置标记
         self.position_marker = self.ax_overview.axvspan(
-            self.time_stamp[self.current_position],  # 起始时间
-            self.time_stamp[self.current_position + self.window_size],  # 结束时间
-            alpha=0.3, color='g'  # 绿色半透明区域
+            self.time_stamp[self.current_position],
+            self.time_stamp[min(end, len(self.data) - 1)],
+            alpha=0.3, color='g'
         )
 
-        # 初始显示更新
+
         self.update_display()
 
     @staticmethod
@@ -138,8 +170,65 @@ class LargeDataSlidePlot:
         self.current_position = int(val)  # 更新当前位置
         self.update_display()  # 更新显示
 
+    def on_mouse_press(self, event):
+        """鼠标按下事件 - 检测是否在按钮区域"""
+        if event.inaxes == self.btn_left_ax:
+            self.press_direction = -1
+            self._move_position()
+            if self.press_timer is None:
+                self.press_timer = self.fig.canvas.new_timer(interval=10)  # 10ms间隔
+                self.press_timer.add_callback(self._timer_move)
+                self.press_timer.start()
+        elif event.inaxes == self.btn_right_ax:
+            self.press_direction = 1
+            self._move_position()
+            if self.press_timer is None:
+                self.press_timer = self.fig.canvas.new_timer(interval=10)
+                self.press_timer.add_callback(self._timer_move)
+                self.press_timer.start()
+
+    def on_mouse_release(self, event):
+        """鼠标释放事件"""
+        if self.press_timer is not None:
+            self.press_timer.stop()
+            self.press_timer = None
+        self.press_direction = 0
+
+    def _timer_move(self):
+        """定时器回调 - 长按时连续移动"""
+        self._move_position()
+
+    def _move_position(self):
+        """移动位置的核心逻辑"""
+        if self.press_direction == -1:
+            step = max(0, self.current_position - self.step_size)
+        elif self.press_direction == 1:
+            max_position = len(self.data) - self.window_size - 1
+            step = min(max_position, self.current_position + self.step_size)
+        else:
+            return
+
+        self.current_position = step
+        self.slider.set_val(step)
+        self.update_display()
+
+    def on_ylim_submit(self, text):
+        try:
+            parts = text.split(',')
+            ymin = float(parts[0].strip())
+            ymax = float(parts[1].strip())
+            if ymin < ymax:
+                self.ylim = (ymin, ymax)
+                self.ax_detail.set_ylim(self.ylim)
+                self.fig.canvas.draw_idle()
+            else:
+                print("ymin must be less than ymax!")
+        except (ValueError, IndexError):
+            print("Invalid format! Use: min,max (e.g., -0.1,0.1)")
+
     def update_display(self):
         """更新所有显示内容"""
+        import numpy as np
         # 计算显示范围的结束索引，防止数组越界
         end_idx = min(self.current_position + self.window_size, len(self.data) - 1)
 
@@ -158,8 +247,7 @@ class LargeDataSlidePlot:
         # 设置详细图的坐标轴范围
         self.ax_detail.set_xlim(self.time_stamp[self.current_position],  # X轴起始时间
                                 self.time_stamp[end_idx])  # X轴结束时间
-        self.ax_detail.set_ylim(np.nanmin(y_data),
-                                np.nanmax(y_data))
+        self.ax_detail.set_ylim(self.ylim)
 
         # 更新概览图中的位置标记
         self.position_marker.remove()  # 删除旧的位置标记
@@ -177,6 +265,18 @@ class LargeDataSlidePlot:
 
         # 添加图例
         self.ax_overview.legend()
+        # 强制取消科学计数法（放在 draw 之前）
+        import matplotlib.ticker as ticker
+
+        for ax in [self.ax_overview, self.ax_detail]:
+            # X轴
+            formatter_x = ticker.ScalarFormatter(useOffset=False)
+            formatter_x.set_scientific(False)
+            ax.xaxis.set_major_formatter(formatter_x)
+            # Y轴
+            formatter_y = ticker.ScalarFormatter(useOffset=False)
+            formatter_y.set_scientific(False)
+            ax.yaxis.set_major_formatter(formatter_y)
 
         # 重绘图形，显示所有更新
         self.fig.canvas.draw_idle()

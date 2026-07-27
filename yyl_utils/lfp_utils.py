@@ -3,6 +3,7 @@ from typing import Iterable,Union,Tuple
 from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from pathlib import Path
+    import numpy as np
 
 
 def fit_log_pink_noise(freqs, psd, fit_range=(1, 40), peak_width_limits=(0.98 * 2, 8),
@@ -34,6 +35,8 @@ def fit_log_pink_noise(freqs, psd, fit_range=(1, 40), peak_width_limits=(0.98 * 
         freq_mask : ndarray - 指定频率范围的频率
         psd_mask : ndarray - 原始PSD（指定范围）
         psd_fit_mask : ndarray - 拟合的背景噪声PSD（指定范围）
+        offset : float - 线性拟合的截距
+        slope : float - 线性拟合的斜率
     """
     from specparam import SpectralModel
     import numpy as np
@@ -57,7 +60,7 @@ def fit_log_pink_noise(freqs, psd, fit_range=(1, 40), peak_width_limits=(0.98 * 
     offset, slope = fm.results.params.aperiodic.params[0:2]
     psd_fit_mask = 10 ** (offset - slope * np.log10(freq_mask))
 
-    return freq_mask, psd_mask, psd_fit_mask
+    return freq_mask, psd_mask, psd_fit_mask, offset, slope
 
 class SOSFilter:
     """
@@ -94,13 +97,6 @@ class SOSFilter:
         padlen : int, optional
             filtfilt的填充长度，None时自动计算
         """
-        global np, signal, plt, yyl
-        # noinspection PyUnresolvedReferences
-        import numpy as np
-        # noinspection PyUnresolvedReferences
-        from scipy import signal
-        # noinspection PyUnresolvedReferences
-        import matplotlib.pyplot as plt
         self.filter_type = filter_type.lower()
         self.fs = fs
         self.order = order
@@ -142,6 +138,7 @@ class SOSFilter:
 
     def _design_standard_filter(self, nyquist):
         """设计标准IIR滤波器"""
+        import scipy.signal as signal
         if self.filter_type == 'lowpass':
             cutoff = self.f1 / nyquist
             Wn = cutoff
@@ -177,6 +174,7 @@ class SOSFilter:
 
     def _design_notch_filter(self):
         """设计陷波滤波器"""
+        import scipy.signal as signal
         if self.notch_freq is None:
             raise ValueError("陷波滤波器需要指定notch_freq参数")
 
@@ -203,6 +201,7 @@ class SOSFilter:
         filtered_data : ndarray
             滤波后的数据（零相位延迟）
         """
+        import scipy.signal as signal
         if self.sos is None:
             raise ValueError("滤波器未正确设计")
 
@@ -230,6 +229,7 @@ class SOSFilter:
         zf : ndarray
             最终状态（用于连续滤波）
         """
+        import scipy.signal as signal
         if self.sos is None:
             raise ValueError("滤波器未正确设计")
 
@@ -245,6 +245,9 @@ class SOSFilter:
 
     def plot_response(self, worN=2000, freq_lim=None):
         """绘制频率响应"""
+        import scipy.signal as signal
+        import matplotlib.pyplot as plt
+        import numpy as np
         if self.sos is None:
             print("滤波器未设计")
             return
@@ -351,6 +354,8 @@ class SOSFilter:
     @staticmethod
     def demonstrate_filtfilt_advantage():
         """演示filtfilt双向滤波的优势"""
+        import matplotlib.pyplot as plt
+        import numpy as np
         fs = 1000
         t = np.linspace(0, 1, fs)
 
@@ -416,6 +421,8 @@ class SOSFilter:
     @staticmethod
     def test_bandpass_low_freq():
         """测试低频带通滤波（你的具体用例）"""
+        import matplotlib.pyplot as plt
+        import numpy as np
         fs = 1000
         t = np.linspace(0, 10, 10 * fs)
 
@@ -725,10 +732,33 @@ def calc_heatmap_PAC(lfp_value: np.ndarray,
     return df_results
 
 
-
 class RippleDetector:
     # noinspection PyUnresolvedReferences
-    def __init__(self):
+    def __init__(
+            self,
+            fs: int = 1000,
+            bandpass_freq: list = None,
+            N_bandpass: int = 4,
+            notch_f0: int = 50,
+            notch_bandwidth: int = 1,
+            gauss_sigma: float = 5.33,
+            gauss_truncate: float = 4.0,
+            half_window_len: int = 3000,
+            high_fold: int = 5,
+            low_fold: int = 2,
+            continuous_time: int = 7,
+            epoch_high_time: int = 10,
+            ripple_concat_time: int = 50,
+            ripple_longest_time: int = 450,
+            ripple_shortest_time: int = 50,
+            soft_wrong_dots_threshold: int = 20,
+            hard_wrong_dots_threshold: int = 3,
+            is_plot: bool = False,
+            figure_width: int = 200,
+            figure_num_waveforms: int = 500,
+            html_path: str = "",
+            figure_name: str = '阈值图'
+    ):
         """
                 初始化Ripple检测器参数
 
@@ -759,46 +789,56 @@ class RippleDetector:
                     ripple_concat_time: ripple合并间隔50采样点（50ms），间隔小于此时间的ripple合并
                     ripple_longest_time: ripple最长持续时间450采样点（450ms），超过此时间的不认为是ripple
                     ripple_shortest_time: ripple最短持续时间50采样点（50ms），短于此时间的不认为是ripple
-                    wrong_dots_threshold: 异常点阈值20，如果某个ripple的时间内有任何一个点的z-score大于该值，则删掉这个ripple
+                    soft_wrong_dots_threshold: 异常点阈值20，如果某个ripple的时间内有任何一个点的z-score大于该值，则删掉这个ripple
+                    hard_wrong_dots_threshold: 硬阈值检测，该阈值是限定的阈值，单位跟随lfp的单位
 
                 绘图参数：
-                    is_plot: 是否生成绘图，True
+                    is_plot: 是否生成绘图，False
                     figure_width: 图形宽度参数200，具体用途请确认（可能是像素或缩放比例）
+                    figure_num_waveforms: 波形图中显示的波形数量500
                     html_path: HTML文件保存的文件夹的路径
                     figure_name: 图形名称'阈值图'
                 """
-        self.fs=1000
+
+        from pathlib import Path
+
+        # 处理可变默认参数
+        if bandpass_freq is None:
+            bandpass_freq = [100, 250]
+
+        # 基本参数
+        self.fs = fs
 
         # 带通滤波参数
-        self.bandpass_freq=[100,250]
-        self.N_bandpass=4
+        self.bandpass_freq = bandpass_freq
+        self.N_bandpass = N_bandpass
 
         # notch滤波参数
-        self.notch_f0=50
-        self.notch_bandwidth=1
+        self.notch_f0 = notch_f0
+        self.notch_bandwidth = notch_bandwidth
 
         # 计算高斯包络参数
-        self.gauss_sigma=5.33
-        self.gauss_truncate=4.0
+        self.gauss_sigma = gauss_sigma
+        self.gauss_truncate = gauss_truncate
 
         # Ripple检测参数, 其中涉及数值均为采样点数
-        self.half_window_len = 3000      #进行滑动计算均值和SD的窗长的一半
-        self.high_fold = 5      #高阈值检测限的SD倍数
-        self.low_fold = 2       #低阈值检测限的SD倍数
-        self.continuous_time = 7       #高频间间距小于continuous_time个采样点的ripple会被合并
-        self.epoch_high_time = 10      #高阈值部分至少要持续epoch_high_time个采样点
-        self.ripple_concat_time = 50   #低频间间距小于ripple_concat_time个采样点的ripple会被合并
-        self.ripple_longest_time =450      #ripple的最长持续时间不多于ripple_longest_time个采样点
-        self.ripple_shortest_time = 50      #ripple的最短持续时间不少于ripple_longest_time个采样点
-        self.soft_wrong_dots_threshold = 20 #阈值检测，该阈值是自适应的阈值，单位是(倍SD)
-        self.hard_wrong_dots_threshold = 3  #阈值检测，该阈值是限定的阈值，单位跟随lfp的单位
+        self.half_window_len = half_window_len
+        self.high_fold = high_fold
+        self.low_fold = low_fold
+        self.continuous_time = continuous_time
+        self.epoch_high_time = epoch_high_time
+        self.ripple_concat_time = ripple_concat_time
+        self.ripple_longest_time = ripple_longest_time
+        self.ripple_shortest_time = ripple_shortest_time
+        self.soft_wrong_dots_threshold = soft_wrong_dots_threshold
+        self.hard_wrong_dots_threshold = hard_wrong_dots_threshold
 
         # 画html图参数
-        self.is_plot = False
-        self.figure_width = 200
-        self.figure_num_waveforms = 500
-        self.html_path = Path(r"")
-        self.figure_name='阈值图'
+        self.is_plot = is_plot
+        self.figure_width = figure_width
+        self.figure_num_waveforms = figure_num_waveforms
+        self.html_path = Path(html_path) if html_path else Path("")
+        self.figure_name = figure_name
 
     def mybandpassfilter(self, lfp):
         """
@@ -806,6 +846,7 @@ class RippleDetector:
         :param lfp: 输入信号数据
         :return: 滤波后的信号
         """
+        import scipy.signal as signal
         nyquist = 0.5 * self.fs
         Wn = (self.bandpass_freq[0] / nyquist, self.bandpass_freq[1] / nyquist)
         # 使用SOS形式设计滤波器
@@ -825,6 +866,7 @@ class RippleDetector:
             返回:
             - filt_data: 滤波后的信号
             """
+        import scipy.signal as signal
         w0 = self.notch_f0 / (self.fs / 2)  # 归一化中心频率（Nyquist 频率归一化）
         Q = self.notch_f0 / self.notch_bandwidth
         b, a = signal.iirnotch(w0=w0, Q=Q)
@@ -837,215 +879,16 @@ class RippleDetector:
         :param raw_data:
         :return: 返回高斯包络
         """
+        import scipy.signal as signal
         from scipy.ndimage import gaussian_filter
+        import numpy as np
         data_envelope = np.abs(signal.hilbert(raw_data))
         data_gauss_envelope = gaussian_filter(data_envelope,
               sigma=self.gauss_sigma, truncate=self.gauss_truncate)
         return data_gauss_envelope
 
-    # 得到包络线的阈值序列
-    def get_threshold_sd(self, envelope_values,) \
-            -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """
-        功能：计算高低阈值和Z-score序列
-        计算公式：
-            threshold_high_sd = 局部均值 + high_fold × 局部标准差
-            threshold_low_sd = 局部均值 + low_fold × 局部标准差
-            z_score_line = (原始值 - 局部均值) / 局部标准差
-        用途：生成自适应的动态阈值
-        :param envelope_values:
-        :param half_window_len:
-        :param high_fold:
-        :param low_fold:
-        :return:
-        返回的是高阈值、低阈值、Z线的值，用于后续作图
-        """
-        # 获取lfp的均值和std序列
-        def get_mean_and_std(envelope_values, half_window_len) -> Tuple[np.ndarray, np.ndarray]:
-            """
-            功能：计算包络线的滑动均值和标准差
-            处理逻辑：
-                使用pandas的rolling窗口计算,采用滑动窗的方法计算该段的均值和标准差
-                窗口大小：2*half_window_len+1（中心对称窗口）
-            输出：每个点的局部均值和标准差
-            :param envelope_values:
-            :param half_window_len:
-            :return:返回与输入序列等长的滑动平均后的序列，以及每个点上的std值
-            """
-            import pandas as pd
-            envelope_values_series = pd.Series(envelope_values)
-            window_mean = envelope_values_series.rolling(2 * half_window_len + 1, min_periods=1,
-                                                         center=True).mean()
-            window_std = envelope_values_series.rolling(2 * half_window_len + 1, min_periods=1,
-                                                        center=True).std()
-            window_mean = window_mean.to_numpy()
-            window_std = window_std.to_numpy()
-            return window_mean, window_std
-
-        window_mean, window_std = get_mean_and_std(envelope_values, self.half_window_len)
-        threshold_high_sd = window_mean + self.high_fold * window_std
-        threshold_low_sd = window_mean + self.low_fold * window_std
-        z_score_line = (envelope_values - window_mean) / (window_std + 1e-12)
-        return threshold_high_sd, threshold_low_sd, z_score_line
-
-    def get_ripple_time(self,envelope_values:np.ndarray, notched_lfp) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-        """
-            # 将超过阈值的index进行融合，得到每个epoch的开始时间和结束时间。如果两个超过阈值时间小于continuous_time则视为一个epoch。
-            # 返回值是一个np.ndarray，矩阵中元素是n行2列，每行的两个元素由每个ripple的起止index组成。
-            # 输入是包络线,输出是符合要求的ripple的开始、结束时间。
-            # 要求：1.小于ripple_concat_time的ripple合并
-            # 2.小于continuous_time的阈下时间跳过
-            # 3.要有高于high_fold的部分，起止时间是高于low_fold的部分
-            # 4.高于high_fold的时间要多于epoch_high_time
-            # 5.最终的ripple时间要大于ripple_shortest_time，小于ripple_longest_time
-            # 6.坏点检测：①如果ripple的时间内有任何一个点的z-score大于soft_wrong_dots_threshold，则删掉这些ripple
-            #           ②如果ripple的时间内有任何一个点的notched_lfp大于hard_wrong_dots_threshold，则删掉这些ripple
-            # 此处的所有涉及到的时间都是以采样点数计算，而不是现实时间。
-        :param envelope_values: 根据包络序列计算ripple时间,
-        notched_lfp：notch后的lfp，用于硬阈值去噪
-        :return: epoches_ripple：ripple的起止时间,
-                threshold_high_sd：高阈值序列(用于画图), threshold_low_sd：低阈值序列(用于画图), z_score_line：Z线(用于画图)
-        """
-
-        # 输入是包络线，输出是超过阈值的epoch的起止时间
-        def get_over_threshold_sequence(envelope_values, threshold_high_sd, threshold_low_sd, continuous_time):
-            """
-            功能：检测超过高低阈值的时间段
-            处理流程：
-                获取高低阈值序列
-                分别找出超过高阈值和低阈值的时间点
-                使用get_epoch将时间点合并为连续时段
-            输出：高阈值时段、低阈值时段、阈值序列、Z-score
-            :param envelope_values:
-            :param half_window_len:
-            :param high_fold:
-            :param low_fold:
-            :param continuous_time:
-            :return:
-            epoch_high_sd:一个list，其中元素为2个元素构成的tuple，tuple中的值为超过高阈值的始末点
-            epoch_low_sd：类似epoch_high_sd
-            threshold_high_sd：与输入序列等长的高阈值线的值,用于后续作图
-            threshold_low_sd：类似threshold_high_sd,
-            z_score_line：与输入序列等长的Z线的值，用于后续作图
-            """
-
-            def get_epoch(overthreshold_time_sequence: list, continuous_time: int) -> list[Tuple[int, int]]:
-                """
-                功能：将离散的超过阈值的时间点合并成连续的时间段
-                处理逻辑：
-                如果相邻时间点间隔 ≤ continuous_time，则合并为同一个时段
-                :param overthreshold_time_sequence:超过阈值的时间点序列 [t1, t2, t3, ...]
-                :param continuous_time:
-                :return:时段列表 [(start1, end1), (start2, end2), ...]
-                """
-                epoch_time = []
-                n1 = 0
-                while n1 < len(overthreshold_time_sequence):
-                    start_epoch_time = overthreshold_time_sequence[n1]
-                    while n1 < len(overthreshold_time_sequence) - 1 and (
-                            overthreshold_time_sequence[n1 + 1] - overthreshold_time_sequence[n1] <= continuous_time):
-                        n1 += 1
-                    end_epoch_time = overthreshold_time_sequence[n1]
-                    epoch_time.append((start_epoch_time, end_epoch_time))
-                    n1 += 1
-                return epoch_time
-
-            idx_high_sd = []
-            idx_low_sd = []
-            for n1, value in enumerate(envelope_values):
-                if np.abs(value) > threshold_high_sd[n1]:
-                    idx_high_sd.append(n1)
-                if np.abs(value) > threshold_low_sd[n1]:
-                    idx_low_sd.append(n1)
-            epoch_high_sd = get_epoch(idx_high_sd, continuous_time)
-            epoch_low_sd = get_epoch(idx_low_sd, continuous_time)
-            return epoch_high_sd, epoch_low_sd
-
-        def get_low_high_overlap(epoch_low, epoch_high):
-            """筛选出epoch_low中包含至少一个epoch_high的epoch"""
-            # 先检查列表是否为空
-            if len(epoch_low) == 0 or len(epoch_high) == 0:
-                return []
-
-            # 再转换为NumPy数组
-            low_arr = np.array(epoch_low)
-            high_arr = np.array(epoch_high)
-
-            # 使用广播加速
-            overlaps = []
-            for low_start, low_end in low_arr:
-                # 向量化检查：high是否在low内
-                mask = (high_arr[:, 0] >= low_start) & (high_arr[:, 1] <= low_end)
-                if np.any(mask):
-                    overlaps.append((low_start, low_end))
-
-            return overlaps
-
-        def concat_continuous_ripple(raw_epoch,ripple_concat_time):
-            """
-            将ripple间间隔小于ripple_concat_time的合并
-            :param raw_epoch:
-            :param ripple_concat_time:
-            :return: 返回合并后的epoch
-            """
-            concated_epoch = []
-            n1 = 0
-            while n1 < len(raw_epoch) - 1:
-                if raw_epoch[n1 + 1][0] - raw_epoch[n1][1] <= ripple_concat_time:
-                    concated_epoch.append((raw_epoch[n1][0], raw_epoch[n1 + 1][1]))
-                    n1 += 2
-                    continue
-                if raw_epoch[n1 + 1][0] - raw_epoch[n1][1] > ripple_concat_time:
-                    concated_epoch.append(raw_epoch[n1])
-                    n1 += 1
-            if n1 == len(raw_epoch) - 1:  # 当n1是最后一个元素时
-                concated_epoch.append(raw_epoch[n1])
-            return concated_epoch
-
-        def screen_appropriate_time_ripple(raw_epoch,ripple_shortest_time,ripple_longest_time):
-            """
-            将持续时间大于ripple_longest_time的ripple去掉
-            :return:
-            """
-            screened_epoch = []
-            for item in raw_epoch:
-                if (item[1] - item[0] <= ripple_longest_time) & (item[1] - item[0] >= ripple_shortest_time):
-                    screened_epoch.append(item)
-            return screened_epoch
-
-        def delete_wrong_dots(ripple_series, z_score_line, soft_wrong_dots_threshold):
-            '''判断z_score_line中在时间范围ripple_series内是否有值大于soft_wrong_dots_threshold的点，并删除这些点'''
-            ripple_series = [epoch for epoch in ripple_series
-                             if not np.any(z_score_line[epoch[0]:epoch[1]] >= soft_wrong_dots_threshold)]
-            return ripple_series
-
-        threshold_high_sd, threshold_low_sd, z_score_line = (
-            self.get_threshold_sd(envelope_values))
-        epoch_high_sd, epoch_low_sd = get_over_threshold_sequence(
-            envelope_values, threshold_high_sd, threshold_low_sd, self.continuous_time)
-        # 筛选ripple的超过高阈值的时间大于self.epoch_high_time的ripple事件
-        epoch_high_sd_2 = [epoch for epoch in epoch_high_sd if epoch[1] - epoch[0] >= self.epoch_high_time]
-        # 获取包含epoch_high的epooch_low
-        epoch_overlap_low = get_low_high_overlap(np.array(epoch_low_sd), np.array(epoch_high_sd_2))
-        # 融合相距过近的ripple事件
-        epoch_concated=concat_continuous_ripple(epoch_overlap_low,self.ripple_concat_time)
-        # 筛选出时长在self.ripple_shortest_time和self.ripple_longest_time范围内的ripple
-        epoch_screened=screen_appropriate_time_ripple(epoch_concated,self.ripple_shortest_time,self.ripple_longest_time)
-        # 去除噪音过大的点
-        if self.soft_wrong_dots_threshold :
-            # 软阈值去除超过self.soft_wrong_dots_threshold*STD的点
-            epoch_screened = delete_wrong_dots(epoch_screened, z_score_line, self.soft_wrong_dots_threshold)
-        if self.hard_wrong_dots_threshold :
-            # 去除notch后lfp中的值超过self.hard_wrong_dots_threshold的点
-            epoch_screened = delete_wrong_dots(epoch_screened, notched_lfp, self.hard_wrong_dots_threshold)
-        epoches_ripple = epoch_screened
-        # 对ripple事件按时间排序
-        epoches_ripple = sorted(epoches_ripple, key=lambda x: x[0])
-        epoches_ripple = np.array(epoches_ripple)
-        print(f'检测结束，共检测到{len(epoches_ripple)}个ripple')
-        return epoches_ripple, threshold_high_sd, threshold_low_sd, z_score_line
-
-    def plot_html(self, lfp, envelope, figure_width, num_waveforms, threshold_high_sd, threshold_low_sd,
+    @staticmethod
+    def plot_html(lfp, envelope, figure_width, num_waveforms, threshold_high_sd, threshold_low_sd,
                   htmlTotalPath:Path, file_name:str,
                   epoches_ripple):
         """
@@ -1063,6 +906,9 @@ class RippleDetector:
         """
         import os
         import gc
+        import yyl_utils as yyl
+        import numpy as np
+        from pathlib import Path
         # 画交互式图
         def create_interactive_ripple_plot_with_lines(ripple_line, idx, envelope_line,
                                                       threshold_high_sd_line, threshold_low_sd_line, output_file):
@@ -1251,6 +1097,208 @@ class RippleDetector:
                     ripple_line_row, axv_idx_row, evnelope_line_row,
                     threshold_high_sd_line_row, threshold_low_sd_line_row,
                     output_file=output_file_name)
+
+    # 得到包络线的阈值序列
+    def get_threshold_sd(self, envelope_values,) \
+            -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """
+        功能：计算高低阈值和Z-score序列
+        计算公式：
+            threshold_high_sd = 局部均值 + high_fold × 局部标准差
+            threshold_low_sd = 局部均值 + low_fold × 局部标准差
+            z_score_line = (原始值 - 局部均值) / 局部标准差
+        用途：生成自适应的动态阈值
+        :param envelope_values:
+        :param half_window_len:
+        :param high_fold:
+        :param low_fold:
+        :return:
+        返回的是高阈值、低阈值、Z线的值，用于后续作图
+        """
+        # 获取lfp的均值和std序列
+        def get_mean_and_std(envelope_values, half_window_len) -> Tuple[np.ndarray, np.ndarray]:
+            """
+            功能：计算包络线的滑动均值和标准差
+            处理逻辑：
+                使用pandas的rolling窗口计算,采用滑动窗的方法计算该段的均值和标准差
+                窗口大小：2*half_window_len+1（中心对称窗口）
+            输出：每个点的局部均值和标准差
+            :param envelope_values:
+            :param half_window_len:
+            :return:返回与输入序列等长的滑动平均后的序列，以及每个点上的std值
+            """
+            import pandas as pd
+            envelope_values_series = pd.Series(envelope_values)
+            window_mean = envelope_values_series.rolling(2 * half_window_len + 1, min_periods=1,
+                                                         center=True).mean()
+            window_std = envelope_values_series.rolling(2 * half_window_len + 1, min_periods=1,
+                                                        center=True).std()
+            window_mean = window_mean.to_numpy()
+            window_std = window_std.to_numpy()
+            return window_mean, window_std
+
+        window_mean, window_std = get_mean_and_std(envelope_values, self.half_window_len)
+        threshold_high_sd = window_mean + self.high_fold * window_std
+        threshold_low_sd = window_mean + self.low_fold * window_std
+        z_score_line = (envelope_values - window_mean) / (window_std + 1e-12)
+        return threshold_high_sd, threshold_low_sd, z_score_line
+
+    def get_ripple_time(self,envelope_values:np.ndarray, notched_lfp) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """
+            # 将超过阈值的index进行融合，得到每个epoch的开始时间和结束时间。如果两个超过阈值时间小于continuous_time则视为一个epoch。
+            # 返回值是一个np.ndarray，矩阵中元素是n行2列，每行的两个元素由每个ripple的起止index组成。
+            # 输入是包络线,输出是符合要求的ripple的开始、结束时间。
+            # 要求：1.小于ripple_concat_time的ripple合并
+            # 2.小于continuous_time的阈下时间跳过
+            # 3.要有高于high_fold的部分，起止时间是高于low_fold的部分
+            # 4.高于high_fold的时间要多于epoch_high_time
+            # 5.最终的ripple时间要大于ripple_shortest_time，小于ripple_longest_time
+            # 6.坏点检测：①如果ripple的时间内有任何一个点的z-score大于soft_wrong_dots_threshold，则删掉这些ripple
+            #           ②如果ripple的时间内有任何一个点的notched_lfp大于hard_wrong_dots_threshold，则删掉这些ripple
+            # 此处的所有涉及到的时间都是以采样点数计算，而不是现实时间。
+        :param envelope_values: 根据包络序列计算ripple时间,
+        notched_lfp：notch后的lfp，用于硬阈值去噪
+        :return: epoches_ripple：ripple的起止时间,
+                threshold_high_sd：高阈值序列(用于画图), threshold_low_sd：低阈值序列(用于画图), z_score_line：Z线(用于画图)
+        """
+        import numpy as np
+        # 输入是包络线，输出是超过阈值的epoch的起止时间
+        def get_over_threshold_sequence(envelope_values, threshold_high_sd, threshold_low_sd, continuous_time):
+            """
+            功能：检测超过高低阈值的时间段
+            处理流程：
+                获取高低阈值序列
+                分别找出超过高阈值和低阈值的时间点
+                使用get_epoch将时间点合并为连续时段
+            输出：高阈值时段、低阈值时段、阈值序列、Z-score
+            :param envelope_values:
+            :param half_window_len:
+            :param high_fold:
+            :param low_fold:
+            :param continuous_time:
+            :return:
+            epoch_high_sd:一个list，其中元素为2个元素构成的tuple，tuple中的值为超过高阈值的始末点
+            epoch_low_sd：类似epoch_high_sd
+            threshold_high_sd：与输入序列等长的高阈值线的值,用于后续作图
+            threshold_low_sd：类似threshold_high_sd,
+            z_score_line：与输入序列等长的Z线的值，用于后续作图
+            """
+
+            def get_epoch(overthreshold_time_sequence: list, continuous_time: int) -> list[Tuple[int, int]]:
+                """
+                功能：将离散的超过阈值的时间点合并成连续的时间段
+                处理逻辑：
+                如果相邻时间点间隔 ≤ continuous_time，则合并为同一个时段
+                :param overthreshold_time_sequence:超过阈值的时间点序列 [t1, t2, t3, ...]
+                :param continuous_time:
+                :return:时段列表 [(start1, end1), (start2, end2), ...]
+                """
+                epoch_time = []
+                n1 = 0
+                while n1 < len(overthreshold_time_sequence):
+                    start_epoch_time = overthreshold_time_sequence[n1]
+                    while n1 < len(overthreshold_time_sequence) - 1 and (
+                            overthreshold_time_sequence[n1 + 1] - overthreshold_time_sequence[n1] <= continuous_time):
+                        n1 += 1
+                    end_epoch_time = overthreshold_time_sequence[n1]
+                    epoch_time.append((start_epoch_time, end_epoch_time))
+                    n1 += 1
+                return epoch_time
+
+            idx_high_sd = []
+            idx_low_sd = []
+            for n1, value in enumerate(envelope_values):
+                if np.abs(value) > threshold_high_sd[n1]:
+                    idx_high_sd.append(n1)
+                if np.abs(value) > threshold_low_sd[n1]:
+                    idx_low_sd.append(n1)
+            epoch_high_sd = get_epoch(idx_high_sd, continuous_time)
+            epoch_low_sd = get_epoch(idx_low_sd, continuous_time)
+            return epoch_high_sd, epoch_low_sd
+
+        def get_low_high_overlap(epoch_low, epoch_high):
+            """筛选出epoch_low中包含至少一个epoch_high的epoch"""
+            # 先检查列表是否为空
+            if len(epoch_low) == 0 or len(epoch_high) == 0:
+                return []
+
+            # 再转换为NumPy数组
+            low_arr = np.array(epoch_low)
+            high_arr = np.array(epoch_high)
+
+            # 使用广播加速
+            overlaps = []
+            for low_start, low_end in low_arr:
+                # 向量化检查：high是否在low内
+                mask = (high_arr[:, 0] >= low_start) & (high_arr[:, 1] <= low_end)
+                if np.any(mask):
+                    overlaps.append((low_start, low_end))
+
+            return overlaps
+
+        def concat_continuous_ripple(raw_epoch,ripple_concat_time):
+            """
+            将ripple间间隔小于ripple_concat_time的合并
+            :param raw_epoch:
+            :param ripple_concat_time:
+            :return: 返回合并后的epoch
+            """
+            concated_epoch = []
+            n1 = 0
+            while n1 < len(raw_epoch) - 1:
+                if raw_epoch[n1 + 1][0] - raw_epoch[n1][1] <= ripple_concat_time:
+                    concated_epoch.append((raw_epoch[n1][0], raw_epoch[n1 + 1][1]))
+                    n1 += 2
+                    continue
+                if raw_epoch[n1 + 1][0] - raw_epoch[n1][1] > ripple_concat_time:
+                    concated_epoch.append(raw_epoch[n1])
+                    n1 += 1
+            if n1 == len(raw_epoch) - 1:  # 当n1是最后一个元素时
+                concated_epoch.append(raw_epoch[n1])
+            return concated_epoch
+
+        def screen_appropriate_time_ripple(raw_epoch,ripple_shortest_time,ripple_longest_time):
+            """
+            将持续时间大于ripple_longest_time的ripple去掉
+            :return:
+            """
+            screened_epoch = []
+            for item in raw_epoch:
+                if (item[1] - item[0] <= ripple_longest_time) & (item[1] - item[0] >= ripple_shortest_time):
+                    screened_epoch.append(item)
+            return screened_epoch
+
+        def delete_wrong_dots(ripple_series, z_score_line, soft_wrong_dots_threshold):
+            '''判断z_score_line中在时间范围ripple_series内是否有值大于soft_wrong_dots_threshold的点，并删除这些点'''
+            ripple_series = [epoch for epoch in ripple_series
+                             if not np.any(z_score_line[epoch[0]:epoch[1]] >= soft_wrong_dots_threshold)]
+            return ripple_series
+
+        threshold_high_sd, threshold_low_sd, z_score_line = (
+            self.get_threshold_sd(envelope_values))
+        epoch_high_sd, epoch_low_sd = get_over_threshold_sequence(
+            envelope_values, threshold_high_sd, threshold_low_sd, self.continuous_time)
+        # 筛选ripple的超过高阈值的时间大于self.epoch_high_time的ripple事件
+        epoch_high_sd_2 = [epoch for epoch in epoch_high_sd if epoch[1] - epoch[0] >= self.epoch_high_time]
+        # 获取包含epoch_high的epooch_low
+        epoch_overlap_low = get_low_high_overlap(np.array(epoch_low_sd), np.array(epoch_high_sd_2))
+        # 融合相距过近的ripple事件
+        epoch_concated=concat_continuous_ripple(epoch_overlap_low,self.ripple_concat_time)
+        # 筛选出时长在self.ripple_shortest_time和self.ripple_longest_time范围内的ripple
+        epoch_screened=screen_appropriate_time_ripple(epoch_concated,self.ripple_shortest_time,self.ripple_longest_time)
+        # 去除噪音过大的点
+        if self.soft_wrong_dots_threshold :
+            # 软阈值去除超过self.soft_wrong_dots_threshold*STD的点
+            epoch_screened = delete_wrong_dots(epoch_screened, z_score_line, self.soft_wrong_dots_threshold)
+        if self.hard_wrong_dots_threshold :
+            # 去除notch后lfp中的值超过self.hard_wrong_dots_threshold的点
+            epoch_screened = delete_wrong_dots(epoch_screened, notched_lfp, self.hard_wrong_dots_threshold)
+        epoches_ripple = epoch_screened
+        # 对ripple事件按时间排序
+        epoches_ripple = sorted(epoches_ripple, key=lambda x: x[0])
+        epoches_ripple = np.array(epoches_ripple)
+        print(f'检测结束，共检测到{len(epoches_ripple)}个符合条件的波形')
+        return epoches_ripple, threshold_high_sd, threshold_low_sd, z_score_line
 
     def total_pipeline(self,lfp:np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         """

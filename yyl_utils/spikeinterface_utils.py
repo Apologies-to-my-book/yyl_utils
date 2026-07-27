@@ -676,7 +676,7 @@ class SpikeSortingPipeline:
         导出到Phy格式
         # 导出到phy，供cellexplorer打开。注意cellexplorer所读取的recording是int16格式的原始文件，并且phy的默认LSB是0.195µV/bit
         # 易格的设备输出的LSB不是这个值
-        # 如果要用phy打开，需要使用powershell管理员，conda activate到phy环境，再输入phy template-gui  folder_phy\params.py
+        # 如果要用phy打开，需要使用powershell管理员，conda activate到phy环境，再输入phy template-gui  folder_phy\\params.py
         Args:
             analyzer_folder: 分析器文件夹
             output_folder: 输出Phy文件夹
@@ -811,7 +811,7 @@ class SpikeSortingPipeline:
             print(f"MATLAB管道执行失败: {error_msg}")
             return None
 
-    def run_pipeline(self, probe: Probe = None, config=None, traces_config=None, n_jobs=1):
+    def run_pipeline(self, probe: Probe = None, config=None, traces_config=None, n_jobs=-1):
         """
         运行完整的spike sorting处理管道
 
