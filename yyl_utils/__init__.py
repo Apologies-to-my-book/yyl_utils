@@ -10,9 +10,8 @@ from .debug_utils import ipdb_debug, decorator_func_error, decorator_func_profil
 from .plot_utils import set_backend,set_chinese_font,plot_CI_map,get_color_with_opencv,fast_plot_psd, \
     LargeDataSlidePlot
 from .other_utils import check_delete_exists_path,matlab_struct_to_dict,isolate,make_sure_folder_exist,\
-    add_suffix_to_filename,delete_path
-from .spikeinterface_utils import print_spikeinterface_sorters,print_sorter_params,print_available_sorters,\
-    SpikeSortingPipeline,launch_phy
+    add_suffix_to_filename,delete_path,SettingsWithSave,IntervalOps
+from .spikeinterface_utils import print_sorter_params,SpikeSortingPipeline,launch_phy
 from .lfp_utils import RippleDetector,calc_heatmap_PAC,calc_psd,calc_band_psd_by_simpson,SOSFilter,\
     fit_log_pink_noise
 
@@ -49,12 +48,12 @@ __all__.extend([
     'get_color_with_opencv',
     'add_suffix_to_filename',
     'delete_path',
+    'SettingsWithSave',
+    'IntervalOps',
 ])
 # .spikeinterface_utils导入
 __all__.extend([
-    'print_spikeinterface_sorters'
-    ,'print_sorter_params'
-    ,'print_available_sorters',
+    'print_sorter_params',
     'SpikeSortingPipeline',
     'launch_phy',
 ])

@@ -75,8 +75,22 @@ class SpikeSortingPipeline:
             self._matlab_available = False
 
     @staticmethod
-    def get_default_sorting_params(sorter_name):
-        """获取默认排序参数"""
+    def get_default_sorting_params(sorter_name, print_all_sorters=False):
+        """
+        获取默认排序参数
+
+        Args:
+            sorter_name: 排序器名称，如 'mountainsort5', 'kilosort2' 等
+            print_all_sorters: 是否打印所有可用的sorter列表。若为True，则打印列表并返回空字典
+
+        Returns:
+            dict: 对应sorter的默认参数字典。若sorter_name不存在，返回空字典，注意mountainsort5返回的是你设置的参数
+        """
+
+        # 如果 print_all_sorters 为 True，打印所有可用的 sorter
+        if print_all_sorters:
+            print_sorter_params()
+
         if sorter_name.lower() == 'mountainsort5':
             return {
                 "scheme": "2",
@@ -102,7 +116,96 @@ class SpikeSortingPipeline:
                 "progress_bar": True,
             }
         else:
-            return {}
+            import spikeinterface.sorters as ss
+            try:
+                return ss.get_default_sorter_params(sorter_name)
+            except Exception:
+                return {}
+
+    @staticmethod
+    def get_default_extensions_params():
+        """获取默认的扩展计算字典"""
+        return {
+            "random_spikes": {
+                "method": "uniform",
+                "max_spikes_per_unit": 500,
+                "margin_size": None,
+                "seed": None
+            },
+            "waveforms": {
+                "ms_before": 1.0,
+                "ms_after": 2.0,
+                "dtype": None
+            },
+            "templates": {
+                "ms_before": 1.0,
+                "ms_after": 2.0,
+                "operators": None
+            },
+            "noise_levels": {},
+            "amplitude_scalings": {
+                "sparsity": None,
+                "max_dense_channels": 16,
+                "ms_before": None,
+                "ms_after": None,
+                "handle_collisions": True,
+                "delta_collision_ms": 2
+            },
+            "correlograms": {
+                "window_ms": 50.0,
+                "bin_ms": 1.0,
+                "method": "auto"
+            },
+            "isi_histograms": {
+                "window_ms": 50.0,
+                "bin_ms": 1.0,
+                "method": "auto"
+            },
+            "principal_components": {
+                "n_components": 5,
+                "mode": "by_channel_local",
+                "whiten": True,
+                "dtype": "float32"
+            },
+            "spike_amplitudes": {
+                "peak_sign": "neg"
+            },
+            "spike_locations": {
+                "ms_before": 0.5,
+                "ms_after": 0.5,
+                "spike_retriver_kwargs": None,
+                "method": "center_of_mass",
+                "method_kwargs": {}
+            },
+            "template_metrics": {
+                "metric_names": None,
+                "peak_sign": "neg",
+                "upsampling_factor": 10,
+                "sparsity": None,
+                "metric_params": None,
+                "metrics_kwargs": None,
+                "include_multi_channel_metrics": False,
+                "delete_existing_metrics": False
+            },
+            "template_similarity": {
+                "method": "cosine",
+                "max_lag_ms": 0,
+                "support": "union"
+            },
+            "unit_locations": {
+                "method": "monopolar_triangulation"
+            },
+            "quality_metrics": {
+                "metric_names": None,
+                "metric_params": None,
+                "qm_params": None,
+                "peak_sign": None,
+                "seed": None,
+                "skip_pc_metrics": False,
+                "delete_existing_metrics": False,
+                "metrics_to_compute": None
+            }
+        }
 
     # 辅助方法
     @staticmethod
@@ -219,7 +322,11 @@ class SpikeSortingPipeline:
 
         # 给重建的recording加上探针信息
         if probe:
+            # 如果提供了探针对象，使用该探针
             rec_fixed.set_probe(probe, in_place=True)
+        else:
+            # 如果没有提供探针，创建默认的线性探针
+            rec_fixed.set_probe(self.get_probe(num_channels=len(chan_ids)), in_place=True)
         # 给重建的recording复制metadata
         rec_fixed.copy_metadata(test_recording)
         # 给重建的recording加上LSB,_properties中包括LSB信息
@@ -314,17 +421,22 @@ class SpikeSortingPipeline:
         job_dict = {
             'sorter_name': sorter_name,
             'recording': recording,
-            'folder': output_folder,
+            # 'folder': output_folder,
             'verbose': True,
             'raise_error': False,
             'remove_existing_folder': True,
-            'delete_output_folder': False,
+            'delete_output_folder': True,
             # , 'docker_image': True, 'delete_container_files': False
             # , 'installation_mode': "folder", 'spikeinterface_folder_source':  # spikeinterface安装包路径
             #  r"C:\Users\32707\Desktop\工作\用户实验\张刘馨黛-数据分析\测试代码\安装包\spikeinterface-main\spikeinterface-main"
         }
         job_dict.update(params)
         sorting = ss.run_sorter(**job_dict)
+        # 给各个unit添加前缀 "raw_unit_"
+        if len(sorting.unit_ids) > 0:
+            new_ids = [f"raw_unit_{i}" for i in range(1, len(sorting.unit_ids) + 1)]
+            sorting = sorting.rename_units(new_ids)
+        sorting.save(folder=output_folder, overwrite=True)
         return sorting
 
     def batch_sorting(self, input_folder_list: list[str], output_base_folder, sorter_name, params=None, n_jobs=1):
@@ -348,13 +460,14 @@ class SpikeSortingPipeline:
         job_list = []
         for index, folder_path in enumerate(input_folder_list):
             recording = si.load(folder_path)
-            verbose_path = output_base_folder / f"{index}" / f'verbose{index}'
-            yyl.check_delete_exists_path([verbose_path])
+            # verbose_path = output_base_folder / f"{index}" / f'verbose{index}'
+            # yyl.check_delete_exists_path([verbose_path])
 
             job_dict = {
                 'sorter_name': sorter_name,
                 'recording': recording.clone(),
-                'folder': verbose_path,
+                # 'folder': verbose_path,
+                'delete_output_folder': True,
                 'verbose': True,
                 'remove_existing_folder': False,
                 'raise_error': False,
@@ -374,9 +487,24 @@ class SpikeSortingPipeline:
             engine='joblib',
             engine_kwargs={'n_jobs': n_jobs}
         )
+
+        if sortings is not None:
+            for i, sorting in enumerate(sortings):
+                # 给各个unit添加前缀 "raw_unit_"
+                if len(sorting.unit_ids) > 0:
+                    new_ids = [f"raw_unit_{j}" for j in range(1, len(sorting.unit_ids) + 1)]
+                    sorting = sorting.rename_units(new_ids)
+                    sortings[i] = sorting  # ← 更新列表
+
+                # 保存到 output_base_folder 下的 sorting_results 文件夹
+                save_folder = output_base_folder / f"sorting_{i}"  # ← 保存位置
+                yyl.check_delete_exists_path(save_folder)
+                yyl.make_sure_folder_exist(save_folder)
+                sorting.save(folder=save_folder, overwrite=True)
         return sortings
 
-    def create_analyzer(self, recording_folder, sorting_folder, output_folder, output_qm_path: None, n_jobs=1):
+    def create_analyzer(self, recording_folder, sorting_folder, output_folder, extensions_dict=None,
+                        compute=True, template_metrics_path=None, qm_path=None, n_jobs=1):
         """
         创建排序分析器
 
@@ -384,7 +512,16 @@ class SpikeSortingPipeline:
             recording_folder: 记录数据文件夹
             sorting_folder: 排序结果文件夹
             output_folder: 输出分析器文件夹
-            output_qm_path: 是否保存qm矩阵
+            extensions_dict: 扩展计算参数字典，键为扩展名，值为该扩展的参数。
+                如果为None，则使用默认扩展参数（见 get_default_extensions_dict 方法）
+            compute: 是否立即计算扩展，默认为True。
+                如果为False，则只创建分析器但不计算扩展，需后续手动调用 analyzer.compute()
+            template_metrics_path: 是否保存模板矩阵（template_metrics）到Excel文件，默认为None。
+                如果传入路径，则保存质量指标矩阵到该路径
+            qm_path: 是否保存质量指标（quality_metrics）到Excel文件，默认为None。
+                如果传入路径，则保存质量指标矩阵到该路径
+            n_jobs: 并行计算使用的CPU核心数，默认为1。
+                设置为-1表示使用所有可用核心
         """
         # 延迟导入 spikeinterface
         import spikeinterface as si
@@ -407,27 +544,14 @@ class SpikeSortingPipeline:
             folder=output_folder
         )
 
-        analyzer.compute('random_spikes', n_jobs=n_jobs)
-        analyzer.compute('waveforms', n_jobs=n_jobs, ms_before=0.7, ms_after=1.3)
-        analyzer.compute('templates', n_jobs=n_jobs)
-        analyzer.compute("noise_levels", n_jobs=n_jobs)
-        analyzer.compute("amplitude_scalings", n_jobs=n_jobs)
-        analyzer.compute("correlograms", n_jobs=n_jobs)
-        analyzer.compute("isi_histograms", n_jobs=n_jobs)
-        analyzer.compute("principal_components", n_jobs=n_jobs)
-        analyzer.compute("spike_amplitudes", n_jobs=n_jobs)
-        analyzer.compute("spike_locations", n_jobs=n_jobs)
-        analyzer.compute("template_metrics", n_jobs=n_jobs)
-        analyzer.compute("template_similarity", n_jobs=n_jobs)
-        analyzer.compute("unit_locations", n_jobs=n_jobs)
-        analyzer.compute('quality_metrics', n_jobs=n_jobs)
-
-        if output_qm_path:
-            (analyzer.extensions['quality_metrics'].data['metrics']).to_excel(self.output_paths.qm_excel_path,
-                                                                              index=True)
-
-        ((analyzer.extensions['template_metrics'].data['metrics']).
-         to_excel(self.output_paths.template_metrics_path, index=True))
+        # 一次性计算所有扩展
+        if compute:
+            analyzer.compute(extensions_dict, n_jobs=n_jobs)
+            if template_metrics_path is not None:
+                ((analyzer.extensions['template_metrics'].data['metrics']).
+                 to_excel(self.output_paths.template_metrics_path, index=True))
+            if qm_path is not None:
+                (analyzer.extensions['quality_metrics'].data['metrics']).to_excel(qm_path,index=True)
 
         return analyzer
 
@@ -596,57 +720,164 @@ class SpikeSortingPipeline:
 
         return labels_noise, labels_sua_mua
 
-    def visualize_results(self, analyzer_folder, unit_id=None, fig_folder=None):
+    def visualize_results(self, analyzer_folder, fig_folder=None):
         """
         可视化结果
         Args:
             analyzer_folder: 分析器文件夹
-            unit_id: 特定单元ID（如果为None则显示所有）
+            fig_folder: 结果保存路径文件夹
         """
         # 延迟导入 spikeinterface
         import spikeinterface as si
         import spikeinterface.widgets as sw
         import yyl_utils as yyl
         import matplotlib.pyplot as plt
+        import mpld3
+        from pathlib import Path
 
         analyzer = si.load(analyzer_folder)
-
-        if fig_folder:
-            yyl.make_sure_folder_exist(fig_folder)
-
         # 打印基本信息
         unit_counts = analyzer.sorting.count_num_spikes_per_unit()
         print("unit_id:spike数")
         print({f'{x}': int(y) for (x, y) in unit_counts.items()})
         print(f"各unit通道定位：{analyzer.extensions['unit_locations'].data}")
 
-        # 绘制波形
-        sw.plot_unit_waveforms(
-            sorting_analyzer_or_templates=analyzer,
-            plot_channels=True,
-            scalebar=True,
-            backend="matplotlib"
-        )
-        if fig_folder:
-            plt.savefig(fig_folder / "unit_waveforms.png")
-            plt.close()
-        # plt.show()
+        # 绘制每个神经元的波形
+        if fig_folder and len(analyzer.unit_ids) > 0:
+            yyl.make_sure_folder_exist(fig_folder)
+            # 创建html子文件夹
+            html_folder = Path(fig_folder) / "html"
+            yyl.make_sure_folder_exist(html_folder)
+            print("开始生成可视化图表...")
 
-        # 如果有特定单元ID，绘制单元摘要
-        if unit_id is not None:
-            # os.environ['LANG'] = 'en_US.UTF-8'
-            # os.environ['LC_ALL'] = 'en_US.UTF-8'
-            sw.plot_unit_summary(
-                sorting_analyzer=analyzer,
-                unit_id=unit_id,
-                backend="matplotlib",
-                figsize=(14, 8)
-            )
-            if fig_folder:
-                plt.savefig(fig_folder / f"unit{unit_id}_summary.png")
-                plt.close()
-            # plt.show()
+            for unit_id in analyzer.unit_ids:
+                unit_colors = {unit_id: 'orangered'}
+                print(f"  处理 Unit {unit_id}...")
 
+                # 存储每个子图的figure，用于合并
+                subfigs = []
+
+                # 1. Unit Waveforms
+                fig1, ax1 = plt.subplots(figsize=(10, 8))
+                sw.plot_unit_waveforms(
+                    analyzer,
+                    unit_ids=[unit_id],
+                    unit_colors=unit_colors,
+                    max_spikes_per_unit=500,
+                    plot_templates=True,
+                    plot_channels=True,
+                    same_axis=True,
+                    backend='matplotlib',
+                    plot_legend=False,
+                    ax=ax1,
+                )
+                plt.tight_layout()
+                # 保存HTML
+                mpld3.save_html(fig1, str(html_folder / f"{unit_id}_waveforms.html"))
+                subfigs.append(fig1)  # 添加到列表
+
+                # 2. Waveform Density Map (如果存在)
+                if analyzer.has_extension("waveforms"):
+                    fig2, ax2 = plt.subplots(figsize=(8, 8))
+                    sw.plot_unit_waveforms_density_map(
+                        analyzer,
+                        unit_ids=[unit_id],
+                        unit_colors=unit_colors,
+                        backend='matplotlib',
+                        ax=ax2
+                    )
+                    plt.tight_layout()
+                    # 保存HTML
+                    mpld3.save_html(fig2, str(html_folder / f"{unit_id}_density.html"))
+                    # subfigs.append(fig2)  # 添加到列表
+                else:
+                    # 如果不存在，创建一个空白占位图
+                    fig2, ax2 = plt.subplots(figsize=(8, 8))
+                    ax2.text(0.5, 0.5, 'No Density Map', ha='center', va='center', fontsize=20)
+                    ax2.set_xticks([])
+                    ax2.set_yticks([])
+                    plt.tight_layout()
+                    # subfigs.append(fig2)
+
+                # 3. Auto Correlograms (如果存在)
+                if analyzer.has_extension("correlograms"):
+                    fig3, ax3 = plt.subplots(figsize=(8, 6))
+                    sw.plot_autocorrelograms(
+                        analyzer,
+                        unit_ids=[unit_id],
+                        unit_colors=unit_colors,
+                        backend='matplotlib',
+                        ax=ax3
+                    )
+                    plt.tight_layout()
+                    # 保存HTML
+                    mpld3.save_html(fig3, str(html_folder / f"{unit_id}_autocorr.html"))
+                    subfigs.append(fig3)  # 添加到列表
+                else:
+                    # 如果不存在，创建一个空白占位图
+                    fig3, ax3 = plt.subplots(figsize=(8, 6))
+                    ax3.text(0.5, 0.5, 'No Autocorrelogram', ha='center', va='center', fontsize=20)
+                    ax3.set_xticks([])
+                    ax3.set_yticks([])
+                    plt.tight_layout()
+                    subfigs.append(fig3)
+
+                # 4. Amplitudes (如果存在) - 这个图我们单独保存PNG，不合并
+                if analyzer.has_extension("spike_amplitudes"):
+                    fig4, (ax4a, ax4b) = plt.subplots(1, 2, figsize=(12, 5))
+                    sw.plot_amplitudes(
+                        analyzer,
+                        unit_ids=[unit_id],
+                        unit_colors=unit_colors,
+                        plot_histograms=True,
+                        backend='matplotlib',
+                        axes=[ax4a, ax4b]
+                    )
+                    plt.tight_layout()
+                    # 保存HTML
+                    mpld3.save_html(fig4, str(html_folder / f"{unit_id}_amplitudes.html"))
+                    # 保存单独的PNG（不合并）
+                    # fig4.savefig(str(fig_folder / f"{unit_id}_amplitudes.png"), dpi=300, bbox_inches='tight')
+                    plt.close(fig4)
+
+                # --- 合并前3个图为一张PNG（1行3列） ---
+                # 计算合并图的大小
+                fig_combined, axes = plt.subplots(1, len(subfigs))
+
+                # 将每个子图的内容复制到合并图中
+                for i, subfig in enumerate(subfigs):
+                    # 获取子图的内容
+                    subfig.canvas.draw()
+
+                    # 提取子图的图像数据
+                    subfig.tight_layout()
+                    subfig.canvas.draw()
+
+                    # 将子图转换为图像数组
+                    import numpy as np
+                    from matplotlib.backends.backend_agg import FigureCanvasAgg
+                    canvas = FigureCanvasAgg(subfig)
+                    canvas.draw()
+                    width, height = subfig.get_size_inches() * subfig.dpi
+                    image = np.frombuffer(canvas.tostring_rgb(), dtype='uint8')
+                    image = image.reshape(int(height), int(width), 3)
+
+                    # 显示在合并图的对应位置
+                    axes[i].imshow(image)
+                    axes[i].set_xticks([])
+                    axes[i].set_yticks([])
+                    axes[i].set_title(['Waveforms', 'Autocorrelogram', 'Density Map'][i], fontsize=14)
+
+                plt.tight_layout()
+                # 保存合并的PNG
+                fig_combined.savefig(str(fig_folder / f"{unit_id}_abstract.png"), dpi=300, bbox_inches='tight')
+                plt.close(fig_combined)
+
+                # 关闭所有子图
+                for fig in subfigs:
+                    plt.close(fig)
+
+        # 以下为注释的可选可视化功能
         # sw.plot_all_amplitudes_distributions(sorting_analyser=sorting_analyser)
         # sw.plot_amplitudes(sorting_analyser=sorting_analyser)
         # 绘制每个单元的自相关图
@@ -667,7 +898,7 @@ class SpikeSortingPipeline:
         # sw.plot_unit_waveforms_density_map()
         # sw.plot_unit_waveforms()
 
-        #     用于sorting方法对比
+        # 用于sorting方法对比
         # 可视化两个排序结果之间单元的匹配关系，生成一个一致性矩阵（AgreementMatrix） 或混淆矩阵（ConfusionMatrix）。
         # sw.plot_agreement_matrix
 
@@ -819,6 +1050,7 @@ class SpikeSortingPipeline:
             config: 配置字典，包含管道运行的所有路径参数和设置
                 - sorter_name (str, optional): 使用的spike sorter名称，默认值为'mountainsort5'
                 - sorting_params (dict, optional): sorter-specific的排序参数，默认使用get_default_sorting_params(sorter_name)返回的参数
+                - extensions_dict (dict, optional): 扩展计算参数字典，默认使用get_default_extensions_dict()返回的参数
                 - run_cell_explorer (bool, optional): 是否在管道完成后运行CellExplorer，默认值为False
 
             probe: 定义探针，可以用self.get_probe获得
@@ -856,6 +1088,7 @@ class SpikeSortingPipeline:
         # 解包配置
         sorter_name = config.get('sorter_name', 'mountainsort5')
         sorting_params = config.get('sorting_params', self.get_default_sorting_params(sorter_name))
+        extensions_dict = config.get('extensions_dict', self.get_default_extensions_params())
         run_cell_explorer = config.get('run_cell_explorer', False)
 
         # 执行管道步骤
@@ -898,72 +1131,123 @@ class SpikeSortingPipeline:
             sorting_params
         )
 
-        print("步骤 4/6: 创建分析器...")
-        # 创建SortingAnalyzer并计算质量指标
-        self.create_analyzer(
-            self.output_paths.preprocessed_recording_folder,
-            self.output_paths.sorting_object_folder,
-            self.output_paths.sorting_analyzer_folder,
-            self.output_paths.qm_excel_path,
-            n_jobs=n_jobs,
-        )
-        # 获取unit的类型、sorting质量如何和最大通道等指标
-        self.renew_unit_type(
-            self.output_paths.sorting_analyzer_folder,
-            self.output_paths.cell_type_metrics_path,
-        )
-
-        print("步骤 5/6: 可视化结果...")
-        # 生成排序结果的可视化图表
-        self.visualize_results(
-            self.output_paths.sorting_analyzer_folder,
-            fig_folder=self.output_paths.figures_folder
-        )
-
-        print("步骤 6/6: 导出到Phy...")
-        # 导出为Phy格式用于手动curation
-        self.export_to_phy(
-            self.output_paths.sorting_analyzer_folder,
-            self.output_paths.phy_folder
-        )
-
-        # 可选：运行CellExplorer进行进一步分析
-        if run_cell_explorer and self._matlab_available:
-            print("运行CellExplorer...")
-            matlab_func_path = self.matlab_func_path
-            metrics_path = self.output_paths.cell_metrics_path
-            self.run_cell_explorer(
-                self.output_paths.phy_folder,
-                matlab_func_path,
-                metrics_path
+        try:
+            print("步骤 4/6: 创建分析器...")
+            # 创建SortingAnalyzer并计算质量指标
+            self.create_analyzer(
+                self.output_paths.preprocessed_recording_folder,
+                self.output_paths.sorting_object_folder,
+                self.output_paths.sorting_analyzer_folder,
+                extensions_dict=extensions_dict,
+                compute=True,  # 默认立即计算扩展
+                template_metrics_path= self.output_paths.template_metrics_path,
+                qm_path=self.output_paths.qm_excel_path,
+                n_jobs=n_jobs,
+            )
+            # 获取unit的类型、sorting质量如何和最大通道等指标
+            self.renew_unit_type(
+                self.output_paths.sorting_analyzer_folder,
+                self.output_paths.cell_type_metrics_path,
             )
 
-        print("管道执行完成!")
+            print("步骤 5/6: 可视化结果...")
+            # 生成排序结果的可视化图表
+            self.visualize_results(
+                self.output_paths.sorting_analyzer_folder,
+                fig_folder=self.output_paths.figures_folder / "waveform_figures",
+            )
 
-def print_sorter_params(sorter_name):
+            print("步骤 6/6: 导出到Phy...")
+            # 导出为Phy格式用于手动curation
+            self.export_to_phy(
+                self.output_paths.sorting_analyzer_folder,
+                self.output_paths.phy_folder
+            )
+
+            # 可选：运行CellExplorer进行进一步分析
+            if run_cell_explorer and self._matlab_available:
+                print("运行CellExplorer...")
+                matlab_func_path = self.matlab_func_path
+                metrics_path = self.output_paths.cell_metrics_path
+                self.run_cell_explorer(
+                    self.output_paths.phy_folder,
+                    matlab_func_path,
+                    metrics_path
+                )
+
+            print("管道执行完成!")
+
+        except ValueError as e:
+            if "need at least one array to concatenate" in str(e):
+                print(e)
+                print("存在空unit，继续执行其它文件...")
+            else:
+                raise e  # 其他 ValueError 仍然报错
+
+def print_sorter_params(sorter_name=None):
     """
     获取某个sorting方法的详细参数和描述
-    :param sorter_name:sorting方法名称
+    :param sorter_name: sorting方法名称，若为None则打印所有可用的sorter
     """
-    from spikeinterface.sorters import get_sorter_params_description,get_default_sorter_params
-    print(get_default_sorter_params(sorter_name))
-    description = get_sorter_params_description(sorter_name)
-    for param_name, param_desc in description.items():
-        print(f"{param_name}: {param_desc}")
-
-def print_spikeinterface_sorters():
-    """
-    打印spikeinterface支持的所有sorting方法
-    """
-    from spikeinterface.sorters import available_sorters
-    print(available_sorters())
-
-def print_available_sorters():
-    """
-    打印目前环境下可用的所有sorter名称
-    """
+    from spikeinterface.sorters import get_sorter_params_description, get_default_sorter_params, available_sorters, \
+        installed_sorters
     import os
+
     # 设置CMD为UTF-8模式
-    os.system('chcp 65001')  # 设置控制台为UTF-8
-    from spikeinterface.sorters import installed_sorters
-    print(installed_sorters())
+    os.system('chcp 65001')
+
+    if sorter_name is None:
+        # 打印所有可用的sorter（包括未安装的）
+        available = available_sorters()
+        print("\n" + "=" * 80)
+        print(f"【所有可用的 Sorter】(共 {len(available)} 个):")
+        print("=" * 80)
+        for sorter in available:
+            print(f"  - {sorter}")
+
+        # 打印已安装的sorter
+        installed = installed_sorters()
+        print("\n" + "=" * 80)
+        print(f"【当前环境已安装的 Sorter】(共 {len(installed)} 个):")
+        print("=" * 80)
+        for sorter in installed:
+            print(f"  - {sorter}")
+
+        print("\n" + "=" * 80)
+        print("【各 Sorter 默认参数及参数说明】")
+        print("=" * 80)
+
+        for sorter_name in available:
+            print(f"\n{'=' * 60}")
+            print(f"Sorter: {sorter_name}")
+            print('-' * 60)
+
+            params = get_default_sorter_params(sorter_name)
+            print(f"\n【默认参数】(共 {len(params)} 个):")
+            for key, value in params.items():
+                print(f"    {key}: {value}")
+
+            desc = get_sorter_params_description(sorter_name)
+            print(f"\n【参数说明】:")
+            for key, value in desc.items():
+                print(f"    {key}: {value}")
+
+            print('=' * 60)
+        return
+
+    # 打印单个sorter的参数
+    print("\n" + "=" * 60)
+    print(f"Sorter: {sorter_name}")
+    print('-' * 60)
+
+    params = get_default_sorter_params(sorter_name)
+    print(f"\n【默认参数】(共 {len(params)} 个):")
+    for key, value in params.items():
+        print(f"    {key}: {value}")
+
+    description = get_sorter_params_description(sorter_name)
+    print(f"\n【参数说明】:")
+    for param_name, param_desc in description.items():
+        print(f"    {param_name}: {param_desc}")
+
+    print("\n" + "=" * 60)
