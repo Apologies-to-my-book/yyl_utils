@@ -1,3 +1,22 @@
+"""
+尖峰排序（spike sorting）工具模块。
+
+文件用途：
+提供原始电生理数据读取、SpikeInterface 预处理、尖峰排序、结果分析、可视化、
+Phy 导出和 CellExplorer 联动等功能。
+
+整体结构：
+1. launch_phy()：启动 Phy 图形界面。
+2. SpikeSortingPipeline：封装完整尖峰排序工作流及各个独立处理步骤。
+3. print_sorter_params() 等模块级辅助函数：提供排序器参数查询等功能。
+
+主要执行流程：
+创建 SpikeSortingPipeline 实例后调用 run_pipeline()；该方法依次保存 Recording、
+应用预处理 Pipeline、运行 sorter、创建 SortingAnalyzer、生成图表并导出 Phy 数据。
+get_all_preprocess_pipeline_dict() 用于查询当前 SpikeInterface 支持的全部预处理方法；
+实际运行时可通过 config["preprocess_pipeline_dict"] 自定义预处理流程。
+"""
+
 from __future__ import annotations
 from typing import TYPE_CHECKING
 if TYPE_CHECKING:
@@ -15,7 +34,7 @@ def launch_phy(params_path, conda_env="phy2"):
     # # 使用PowerShell，它处理中文路径更好
     import subprocess
     cmd = f'''
-    & conda activate phy2
+    & conda activate "{conda_env}"
     & phy template-gui "{params_path}"
     '''
     subprocess.run(['powershell', '-Command', cmd])
@@ -28,7 +47,6 @@ class SpikeSortingPipeline:
             self.base_folder: Path = base_folder
             self.raw_recording_folder = base_folder / 'raw_recording_folder'
             self.preprocessed_recording_folder = base_folder / 'preprocessed_recording_folder'
-            self.whittened_recording_folder = base_folder / 'whittened_recording_folder'
             self.sorting_verbose_folder = base_folder / 'sorting_verbose_folder'
             self.sorting_object_folder = base_folder / 'sorting_object_folder'
             self.sorting_analyzer_folder = base_folder / 'sorting_analyzer_folder'
@@ -50,16 +68,7 @@ class SpikeSortingPipeline:
         """
 
         # 只导入必要的轻量级包
-        import os
-        os.environ['KACHERY_API_KEY'] = 'iGnRNcwk2uPk552dRakTwLScoUS78DIU'
-
-        import yyl_utils as yyl
-        import numpy as np
-        import pandas as pd
-        import matplotlib.pyplot as plt
         from pathlib import Path
-        import joblib
-        import traceback
 
         self.input_file = Path(input_file)
         self.matlab_func_path = r""
@@ -75,136 +84,272 @@ class SpikeSortingPipeline:
             self._matlab_available = False
 
     @staticmethod
-    def get_default_sorting_params(sorter_name, print_all_sorters=False):
+    def get_all_sorting_params_dict(sorter_name=None, print_all_sorters=True):
         """
-        获取默认排序参数
+        查询 sorter 的官方默认参数，并可同时打印全部可用 sorter。
 
-        Args:
-            sorter_name: 排序器名称，如 'mountainsort5', 'kilosort2' 等
-            print_all_sorters: 是否打印所有可用的sorter列表。若为True，则打印列表并返回空字典
+        Parameters
+        ----------
+        sorter_name : str | None, default: None
+            需要查询参数的 sorter 名称，例如 ``mountainsort5``。None 时只打印
+            sorter 列表并返回空字典。
+        print_all_sorters : bool, default: True
+            是否打印全部可用和已安装的 sorter。
 
-        Returns:
-            dict: 对应sorter的默认参数字典。若sorter_name不存在，返回空字典，注意mountainsort5返回的是你设置的参数
+        Returns
+        -------
+        dict
+            指定 sorter 的官方默认参数；未指定或查询失败时返回空字典。
         """
-
-        # 如果 print_all_sorters 为 True，打印所有可用的 sorter
         if print_all_sorters:
             print_sorter_params()
 
-        if sorter_name.lower() == 'mountainsort5':
-            return {
-                "scheme": "2",
-                "detect_threshold": 5,
-                "detect_sign": -1,
-                "detect_time_radius_msec": 0.25,
-                "snippet_T1": 20,
-                "snippet_T2": 20,
-                "npca_per_channel": 3,
-                "npca_per_subdivision": 10,
-                "snippet_mask_radius": 250,
-                "scheme1_detect_channel_radius": 150,
-                "scheme2_phase1_detect_channel_radius": 200,
-                "scheme2_detect_channel_radius": 50,
-                "scheme2_max_num_snippets_per_training_batch": 200,
-                "scheme2_training_duration_sec": 300,
-                "scheme2_training_recording_sampling_mode": "uniform",
-                "freq_min": 300,
-                "freq_max": 6000,
-                "filter": False,
-                "whiten": True,
-                "chunk_duration": "1s",
-                "progress_bar": True,
-            }
-        else:
-            import spikeinterface.sorters as ss
-            try:
-                return ss.get_default_sorter_params(sorter_name)
-            except Exception:
-                return {}
+        if sorter_name is None:
+            return {}
+
+        import spikeinterface.sorters as ss
+        try:
+            return ss.get_default_sorter_params(sorter_name)
+        except Exception:
+            print("打印sorter参数时出错，请检查环境中是否有该sorter")
+            return {}
 
     @staticmethod
-    def get_default_extensions_params():
-        """获取默认的扩展计算字典"""
+    def _get_current_sorting_params_dict(sorter_name="mountainsort5"):
+        """
+        返回当前管道实际使用的 sorter 参数。
+
+        Parameters
+        ----------
+        sorter_name : str, default: "mountainsort5"
+            sorter 名称。Mountainsort5 使用本项目固定配置；其他 sorter 返回
+            当前 SpikeInterface 提供的官方默认参数。
+
+        Returns
+        -------
+        dict
+            可以直接传给 sorter 的参数字典。
+        """
+        if sorter_name != "mountainsort5":
+            import spikeinterface.sorters as ss
+
+            return ss.get_default_sorter_params(sorter_name)
+
+        # Recording 已在 preprocess_recording() 中完成带通滤波，因此关闭 sorter
+        # 内部滤波；whitening 保留在 sorter 内，并在按 shank 拆分后分别执行。
         return {
-            "random_spikes": {
-                "method": "uniform",
-                "max_spikes_per_unit": 500,
-                "margin_size": None,
-                "seed": None
+            "scheme": "2",
+            "detect_threshold": 5.5,
+            "detect_sign": -1,
+            "detect_time_radius_msec": 0.5,
+            "snippet_T1": 20,
+            "snippet_T2": 20,
+            "npca_per_channel": 3,
+            "npca_per_subdivision": 10,
+            "snippet_mask_radius": 250,
+            "scheme1_detect_channel_radius": 150,
+            "scheme2_phase1_detect_channel_radius": 200,
+            "scheme2_detect_channel_radius": 50,
+            "scheme2_max_num_snippets_per_training_batch": 200,
+            "scheme2_training_duration_sec": 300,
+            "scheme2_training_recording_sampling_mode": "uniform",
+            "scheme3_block_duration_sec": 1800,
+            "freq_min": 300,
+            "freq_max": 6000,
+            "filter": False,
+            "whiten": True,
+            "delete_temporary_recording": True,
+            "pool_engine": "process",
+            "n_jobs": 1,
+            "chunk_duration": "1s",
+            "progress_bar": True,
+            "mp_context": None,
+            "max_threads_per_worker": 1,
+        }
+
+    @staticmethod
+    def get_all_extensions_params_dict():
+        """获取默认的扩展计算字典"""
+        import spikeinterface as si
+
+        total_extension_dict = {}
+        for extension_name in si.get_available_analyzer_extensions():
+            total_extension_dict[extension_name] = si.get_default_analyzer_extension_params(extension_name=extension_name)
+        print("所有的analyzer扩展如下：")
+        print(total_extension_dict)
+        return total_extension_dict
+
+    @staticmethod
+    def _get_current_extensions_params():
+        """
+        获取本项目默认计算的 SortingAnalyzer 扩展及其参数。
+
+        Returns
+        -------
+        dict
+            键为扩展名称，值为当前 SpikeInterface 版本提供的默认参数。
+
+        Notes
+        -----
+        参数首先从当前安装的 SpikeInterface 动态读取，避免升级后继续使用已经
+        删除或改名的参数。项目只额外修改两项：每个 Unit 最多抽取 500 个随机
+        spikes，并为 templates 同时计算 average、std 和 median；其中 median
+        用于计算 peak-to-peak 最大通道。
+        """
+        import spikeinterface as si
+
+        extension_names = (
+            "random_spikes",
+            "waveforms",
+            "templates",
+            "noise_levels",
+            "amplitude_scalings",
+            "correlograms",
+            "isi_histograms",
+            "principal_components",
+            "spike_amplitudes",
+            "spike_locations",
+            "template_metrics",
+            "template_similarity",
+            "unit_locations",
+            "quality_metrics",
+        )
+        extension_params = {
+            name: si.get_default_analyzer_extension_params(name)
+            for name in extension_names
+        }
+        extension_params["random_spikes"]["max_spikes_per_unit"] = 500
+        extension_params["templates"]["operators"] = ["average", "std", "median"]
+        return extension_params
+
+    @staticmethod
+    def get_all_preprocess_pipeline_dict():
+        """
+        获取当前 SpikeInterface 支持的全部预处理方法及参数默认值。
+
+        参数：
+            无。
+
+        返回值：
+            dict: 第一层键是可以用于 ``apply_preprocessing_pipeline()`` 的方法名；
+            第二层是该方法的参数及默认值。没有默认值的必填参数用中文字符串标记。
+            ``**filter_kwargs`` 等键保存底层可继续传入的扩展参数。
+
+        实现步骤：
+            1. 从 SpikeInterface 的 Pipeline 注册表读取所有受支持的方法。
+            2. 使用 ``inspect.signature()`` 获取每个方法的显式参数和真实默认值。
+            3. 对函数签名中的 ``**kwargs``，继续读取相应底层函数的参数。
+
+        边界情况：
+            该返回值是“全部方法参数目录”，用于查询和复制配置，不能将整个字典
+            一次性传入预处理函数，因为部分方法互斥，而且部分方法需要真实的必填参数。
+            SpikeInterface 的注册表属于内部 API，将来升级大版本后名称可能变化。
+        """
+        from copy import deepcopy
+        import inspect
+
+        from spikeinterface.core import get_noise_levels
+        from spikeinterface.core.recording_tools import get_random_recording_slices
+        from spikeinterface.preprocessing.detect_bad_channels import detect_bad_channels
+        from spikeinterface.preprocessing.pipeline import pp_names_to_functions
+
+        required_text = "<必填：没有默认值>"
+        excluded_recording_parameters = {"recording", "parent_recording"}
+
+        def get_explicit_defaults(function):
+            """读取一个函数的显式参数，并保留继续存在的 *args/**kwargs 标记。"""
+            defaults = {}
+            for parameter in inspect.signature(function).parameters.values():
+                if parameter.name in excluded_recording_parameters:
+                    continue
+                if parameter.kind is inspect.Parameter.VAR_POSITIONAL:
+                    defaults[f"*{parameter.name}"] = []
+                    continue
+                if parameter.kind is inspect.Parameter.VAR_KEYWORD:
+                    defaults[f"**{parameter.name}"] = {
+                        "说明": "底层函数仍允许额外关键字参数，请查看对应函数文档"
+                    }
+                    continue
+                if parameter.default is inspect.Parameter.empty:
+                    defaults[parameter.name] = required_text
+                else:
+                    defaults[parameter.name] = deepcopy(parameter.default)
+            return defaults
+
+        # Pipeline 中几类 **kwargs 实际会继续传给以下底层函数。
+        extra_kwargs_sources = {
+            "filter_kwargs": pp_names_to_functions["filter"],
+            "random_chunk_kwargs": get_random_recording_slices,
+            "detect_bad_channels_kwargs": detect_bad_channels,
+            "noise_levels_kwargs": get_noise_levels,
+        }
+
+        all_preprocess_pipeline = {}
+        for method_name, function in pp_names_to_functions.items():
+            method_parameters = {}
+            for parameter in inspect.signature(function).parameters.values():
+                if parameter.name in excluded_recording_parameters:
+                    continue
+
+                if parameter.kind is inspect.Parameter.VAR_POSITIONAL:
+                    method_parameters[f"*{parameter.name}"] = []
+                    continue
+
+                if parameter.kind is inspect.Parameter.VAR_KEYWORD:
+                    source = extra_kwargs_sources.get(parameter.name)
+                    if source is None:
+                        method_parameters[f"**{parameter.name}"] = {
+                            "说明": "该方法允许额外关键字参数，请查看对应函数文档"
+                        }
+                    else:
+                        expanded_parameters = get_explicit_defaults(source)
+                        if parameter.name == "noise_levels_kwargs":
+                            expanded_parameters["random_slices_kwargs"] = get_explicit_defaults(
+                                get_random_recording_slices
+                            )
+                        method_parameters[f"**{parameter.name}"] = expanded_parameters
+                    continue
+
+                if parameter.default is inspect.Parameter.empty:
+                    method_parameters[parameter.name] = required_text
+                else:
+                    method_parameters[parameter.name] = deepcopy(parameter.default)
+
+            all_preprocess_pipeline[method_name] = method_parameters
+
+        return all_preprocess_pipeline
+
+    @staticmethod
+    def _get_current_preprocess_pipeline_dict():
+        """
+        返回本项目原来实际使用的默认预处理流程。
+
+        返回值：
+            dict: 可以直接传给 ``apply_preprocessing_pipeline()`` 的管道字典。
+
+        说明：
+            原代码使用无参数的通用 ``filter()``。在 SpikeInterface 0.104.8 中，
+            通用 filter 要求显式提供 margin_ms，否则会报错。因此这里使用参数等价、
+            边缘长度可自动计算的 ``bandpass_filter``，滤波范围仍为 300～6000 Hz。
+        """
+        return {
+            "bandpass_filter": {
+                "freq_min": 300.0,
+                "freq_max": 6000.0,
+                "margin_ms": "auto",
             },
-            "waveforms": {
-                "ms_before": 1.0,
-                "ms_after": 2.0,
-                "dtype": None
+            "center": {
+                "mode": "median",
+                "dtype": "float32",
             },
-            "templates": {
-                "ms_before": 1.0,
-                "ms_after": 2.0,
-                "operators": None
+            "blank_saturation": {
+                "abs_threshold": 0.5,
+                "direction": "both",
             },
-            "noise_levels": {},
-            "amplitude_scalings": {
-                "sparsity": None,
-                "max_dense_channels": 16,
-                "ms_before": None,
-                "ms_after": None,
-                "handle_collisions": True,
-                "delta_collision_ms": 2
+            "common_reference": {
+                "reference": "global",
+                "operator": "median",
             },
-            "correlograms": {
-                "window_ms": 50.0,
-                "bin_ms": 1.0,
-                "method": "auto"
-            },
-            "isi_histograms": {
-                "window_ms": 50.0,
-                "bin_ms": 1.0,
-                "method": "auto"
-            },
-            "principal_components": {
-                "n_components": 5,
-                "mode": "by_channel_local",
-                "whiten": True,
-                "dtype": "float32"
-            },
-            "spike_amplitudes": {
-                "peak_sign": "neg"
-            },
-            "spike_locations": {
-                "ms_before": 0.5,
-                "ms_after": 0.5,
-                "spike_retriver_kwargs": None,
-                "method": "center_of_mass",
-                "method_kwargs": {}
-            },
-            "template_metrics": {
-                "metric_names": None,
-                "peak_sign": "neg",
-                "upsampling_factor": 10,
-                "sparsity": None,
-                "metric_params": None,
-                "metrics_kwargs": None,
-                "include_multi_channel_metrics": False,
-                "delete_existing_metrics": False
-            },
-            "template_similarity": {
-                "method": "cosine",
-                "max_lag_ms": 0,
-                "support": "union"
-            },
-            "unit_locations": {
-                "method": "monopolar_triangulation"
-            },
-            "quality_metrics": {
-                "metric_names": None,
-                "metric_params": None,
-                "qm_params": None,
-                "peak_sign": None,
-                "seed": None,
-                "skip_pc_metrics": False,
-                "delete_existing_metrics": False,
-                "metrics_to_compute": None
-            }
         }
 
     # 辅助方法
@@ -220,30 +365,93 @@ class SpikeSortingPipeline:
         return sorting.select_units(kept_units)
 
     @staticmethod
-    def get_probe(num_channels: int = 16, positions=None):
+    def get_probe(
+        num_channels: int = 16,
+        positions=None,
+        shank_id=None,
+        device_channel_indices=None,
+    ):
         """
-        创建探针配置,默认创建的是16通道间隔300um的微丝电极。
-        Args:
-            num_channels: 通道数量，默认为16通道
-            positions: 电极位置列表，每个元素为(x,y)坐标元组。如果为None则自动生成线性排列位置
-        Returns:
-            probe: 配置好的Probe对象，包含电极几何信息和通道映射
+        创建带 shank 分类的微丝电极 Probe。
+
+        Parameters
+        ----------
+        num_channels : int, default: 16
+            通道数量。
+        positions : array-like | None, default: None
+            每个通道的二维坐标，形状为 ``(num_channels, 2)``。None 时按
+            ``[(i * 300, 0) for i in range(num_channels)]`` 生成。
+        shank_id : array-like | None, default: None
+            每个通道所属的 shank ID，长度必须等于通道数。None 时为每个通道
+            分配不同的 shank，即 ``[0, 1, ..., num_channels - 1]``。
+            该映射会保存为recording的"group"属性，并在sorting的时候由
+            run_sorter_by_property保存为unit的“group”属性，在创建analyzer的时候由
+            method="by_property"引进到analyzer的extensions计算。
+        device_channel_indices : array-like | None, default: None
+            建立“Probe 物理触点 → Recording 数据列”的映射，保存的是数据列的
+            数组下标而不是 channel_id。None 时使用 ``[0, 1, ..., num_channels-1]``，
+            表示触点顺序与 Recording 数据列顺序完全一致；未连接的触点可设为
+            ``-1``。该映射会间接影响后续所有依赖通道位置、shank 和 Probe
+            信息的步骤。
+
+        Returns
+        -------
+        Probe
+            已设置坐标、shank ID 和设备通道索引的 Probe。
         """
-        # 只在需要时导入 probeinterface
         from probeinterface import Probe
         import numpy as np
 
         n = num_channels
-        # 如果未提供位置信息，生成默认的线性排列电极位置（间距300um）
+        if not isinstance(n, int) or isinstance(n, bool) or n <= 0:
+            raise ValueError("num_channels 必须是大于 0 的整数")
+
+        # 默认坐标为间距 300 μm 的线性排列。
         if positions is None:
             positions = [(i * 300, 0) for i in range(n)]
-        # 创建2维探针对象，单位设置为微米(um)
+        positions = np.asarray(positions, dtype="float64")
+        if positions.shape != (n, 2):
+            raise ValueError(
+                f"positions 的形状必须是 ({n}, 2)，当前为 {positions.shape}"
+            )
+
+        # 默认每个通道独占一个 shank，为后续按 shank 硬拆分排序提供分组。
+        if shank_id is None:
+            shank_ids = np.arange(n)
+        else:
+            shank_ids = np.asarray(shank_id)
+            if shank_ids.ndim != 1 or shank_ids.size != n:
+                raise ValueError(f"shank_id 必须是一维序列且长度等于 {n}")
+
+        if device_channel_indices is None:
+            device_channel_indices = np.arange(n, dtype="int64")
+        else:
+            device_channel_indices = np.asarray(device_channel_indices)
+            if device_channel_indices.ndim != 1 or device_channel_indices.size != n:
+                raise ValueError(
+                    "device_channel_indices 必须是一维序列且长度等于 "
+                    f"{n}"
+                )
+            if not np.issubdtype(device_channel_indices.dtype, np.integer):
+                raise TypeError("device_channel_indices 只能包含整数下标")
+            device_channel_indices = device_channel_indices.astype("int64", copy=False)
+            if np.any(device_channel_indices < -1):
+                raise ValueError("device_channel_indices 只能是 -1 或非负整数")
+
+            connected_indices = device_channel_indices[device_channel_indices >= 0]
+            if np.unique(connected_indices).size != connected_indices.size:
+                raise ValueError(
+                    "device_channel_indices 中已连接触点的数据列下标不能重复"
+                )
+
         probe = Probe(ndim=2, si_units='um')
-        # 设置电极接触点：圆形电极，半径12.5um
-        probe.set_contacts(positions=positions, shapes='circle', shape_params={'radius': 12.5})
-        # 设置设备通道索引：顺序映射0到n-1
-        channel_indices = np.arange(n)
-        probe.set_device_channel_indices(channel_indices)
+        probe.set_contacts(
+            positions=positions,
+            shapes='circle',
+            shape_params={'radius': 12.5},
+            shank_ids=shank_ids,
+        )
+        probe.set_device_channel_indices(device_channel_indices)
         return probe
 
     def save_traces_to_recording_file(self, traces, fs, chan_ids, outputpath,
@@ -274,9 +482,16 @@ class SpikeSortingPipeline:
             sampling_frequency=fs,
             channel_ids=chan_ids)
 
+        if properties:
+            # 给重建的recording加上LSB等属性，_properties中包括LSB信息
+            rec_fixed._properties = properties
+
         # 给重建的recording加上探针信息
         if probe:
             # 如果提供了探针对象，使用该探针
+            # 注意：如果 Probe 中包含 device_channel_indices=-1，SpikeInterface
+            # 会删除未连接触点；删除后 Probe 通道数与传入的原始数据数组不匹配，
+            # 使用 in_place=True 会直接报错。
             rec_fixed.set_probe(probe, in_place=True)
         else:
             # 如果没有提供探针，创建默认的线性探针
@@ -285,10 +500,6 @@ class SpikeSortingPipeline:
         if metadata_folder:
             # 给重建的recording复制metadata（如通道信息、增益等）
             rec_fixed.load_metadata_from_folder(metadata_folder)
-
-        if properties:
-            # 给重建的recording加上LSB等属性，_properties中包括LSB信息
-            rec_fixed._properties = properties
 
         # 保存重建的recording到二进制文件
         yyl.check_delete_exists_path(outputpath)  # 检查并删除已存在的路径
@@ -320,134 +531,181 @@ class SpikeSortingPipeline:
             sampling_frequency=fs,
             channel_ids=chan_ids)
 
+        # 给重建的recording复制metadata
+        test_recording.copy_metadata(rec_fixed)
+        # 给重建的recording加上LSB,_properties中包括LSB信息
+        rec_fixed._properties = test_recording._properties
+
         # 给重建的recording加上探针信息
         if probe:
             # 如果提供了探针对象，使用该探针
+            # 注意：如果 Probe 中包含 device_channel_indices=-1，SpikeInterface
+            # 会删除未连接触点；删除后 Probe 通道数与传入的原始数据数组不匹配，
+            # 使用 in_place=True 会直接报错。
             rec_fixed.set_probe(probe, in_place=True)
         else:
             # 如果没有提供探针，创建默认的线性探针
             rec_fixed.set_probe(self.get_probe(num_channels=len(chan_ids)), in_place=True)
-        # 给重建的recording复制metadata
-        rec_fixed.copy_metadata(test_recording)
-        # 给重建的recording加上LSB,_properties中包括LSB信息
-        rec_fixed._properties = test_recording._properties
+
 
         # 保存重建的recording
         yyl.check_delete_exists_path(outputpath)
         rec_fixed.save(folder=outputpath, format="binary", name='plx测试', verbose=True, n_jobs=n_jobs)
         return rec_fixed
 
-    def preprocess_recording(self, input_folder, output_folder_preprocessed, output_folder_whitened=None, n_jobs=1):
+    def preprocess_recording(
+        self,
+        input_folder,
+        output_folder_preprocessed,
+        preprocess_pipeline_dict=None,
+        n_jobs=1,
+    ):
         """
-        对原始recording进行预处理
+        使用管道字典对原始 Recording 进行预处理。
 
         Args:
-            input_folder: 输入的recording文件夹
-            output_folder_preprocessed: 进行了其它预处理，白化前的数据
-            output_folder_whitened: 白化后的数据(幅值会改变)
+            input_folder: 输入的 Recording 文件夹。
+            output_folder_preprocessed: 主预处理结果的保存文件夹。
+            preprocess_pipeline_dict: 传给 ``apply_preprocessing_pipeline()`` 的字典。
+                如果为 None，使用本项目原来的默认预处理流程；传入空字典时不执行预处理。
+            n_jobs: 保存 Recording 时使用的并行任务数。
+
+        Returns:
+            预处理并保存后的 Recording。
+
+        实现步骤：
+            1. 加载原始 Recording。
+            2. 应用传入的 Pipeline；未传入时应用项目默认 Pipeline。
+            3. 保存主预处理结果。
+
+        说明：
+            本函数不再提供额外 whitening。Mountainsort5 的 whitening 在按 shank
+            拆分后的 sorting 阶段执行，避免 whitening 跨 shank 混合通道。
+
+        边界情况：
+            preprocess_pipeline_dict 必须是字典或 None；方法名和参数是否有效由
+            SpikeInterface 根据当前安装版本继续校验。
         """
         # 延迟导入 spikeinterface
         import spikeinterface as si
         import spikeinterface.preprocessing as spre
         import yyl_utils as yyl
 
-        lsb = 1
-        yyl.check_delete_exists_path([output_folder_preprocessed, ])
+        if preprocess_pipeline_dict is None:
+            preprocess_pipeline_dict = self._get_current_preprocess_pipeline_dict()
+        if not isinstance(preprocess_pipeline_dict, dict):
+            raise TypeError("preprocess_pipeline_dict 必须是字典或 None")
+
         raw_recording = si.load(file_or_folder_or_dict=input_folder)
-        # 带通滤波
-        highpass_recording = spre.filter(recording=raw_recording)
-        # 去除基线漂移
-        center_recording = spre.center(recording=highpass_recording)
-        # 阈值降噪
-        threshold_recording = spre.blank_saturation(
-            recording=center_recording,
-            abs_threshold=0.5 / lsb,
-            direction='both'
-        )
-        # 公共参考
-        referenced_recording = spre.common_reference(
-            recording=threshold_recording,
-            reference='local',
-            local_radius=(300, 1000)
-        )
+        if preprocess_pipeline_dict:
+            preprocessed_recording = spre.apply_preprocessing_pipeline(
+                recording=raw_recording,
+                pipeline_or_dict=preprocess_pipeline_dict,
+            )
+        else:
+            # 空字典明确表示跳过预处理，但仍然允许后续保存和排序。
+            preprocessed_recording = raw_recording
 
         # 保存预处理后的数据
         yyl.check_delete_exists_path(output_folder_preprocessed)
-        referenced_recording.save(
+        preprocessed_recording.save(
             folder=output_folder_preprocessed,
             format="binary",
             verbose=True,
             n_jobs=n_jobs
         )
 
-        # 白化处理（可选）
-        if output_folder_whitened:
-            whiten_recording = spre.whiten(recording=referenced_recording, dtype='float32')
-            yyl.check_delete_exists_path(output_folder_whitened)
-            whiten_recording.save(
-                folder=output_folder_whitened,
-                format="binary",
-                verbose=True,
-                n_jobs=n_jobs
-            )
-            return referenced_recording, whiten_recording
-
-        return referenced_recording
+        return preprocessed_recording
 
     def perform_sorting(self, input_folder, sorter_name, output_folder, params=None):
         """
-        执行排序
+        按 Probe 的 shank 分组独立执行 sorting，再合并各组结果。
 
-        Args:
-            input_folder: 输入数据文件夹
-            sorter_name: 排序器名称
-            output_folder: 输出文件夹
-            params: 排序参数
+        Parameters
+        ----------
+        input_folder : str | Path
+            预处理后的 Recording 文件夹。
+        sorter_name : str
+            sorter 名称。
+        output_folder : str | Path
+            合并后 Sorting 的保存文件夹。
+        params : dict | None, default: None
+            sorter 参数；None 使用 _get_current_sorting_params_dict()。
+
+        Returns
+        -------
+        BaseSorting
+            合并各 shank 后的 Sorting。
+
+        Notes
+        -----
+        Recording.set_probe() 会根据 Probe.shank_ids 生成 ``group`` 属性。
+        run_sorter_by_property() 先按该属性硬拆分 Recording，因此 sorter 内部的
+        whitening、检测和聚类均不会跨 shank。
         """
-        # 延迟导入 spikeinterface
         import spikeinterface as si
         import spikeinterface.sorters as ss
         import yyl_utils as yyl
+        from pathlib import Path
+        from tempfile import TemporaryDirectory
 
-        # 加载recording
         recording = si.load(input_folder)
 
-        # 设置默认参数
         if params is None:
-            params = self.get_default_sorting_params(sorter_name)
+            params = self._get_current_sorting_params_dict(sorter_name)
+        else:
+            params = params.copy()
 
-        # 运行排序
+        if "group" not in recording.get_property_keys():
+            raise ValueError(
+                "Recording 缺少由 Probe.shank_ids 生成的 'group' 属性，无法按 "
+                "shank 独立 sorting。请先通过 recording.set_probe() 绑定 Probe。"
+            )
+
+        output_folder = Path(output_folder)
+        output_folder.parent.mkdir(parents=True, exist_ok=True)
         yyl.check_delete_exists_path(output_folder)
-        job_dict = {
-            'sorter_name': sorter_name,
-            'recording': recording,
-            # 'folder': output_folder,
-            'verbose': True,
-            'raise_error': False,
-            'remove_existing_folder': True,
-            'delete_output_folder': True,
-            # , 'docker_image': True, 'delete_container_files': False
-            # , 'installation_mode': "folder", 'spikeinterface_folder_source':  # spikeinterface安装包路径
-            #  r"C:\Users\32707\Desktop\工作\用户实验\张刘馨黛-数据分析\测试代码\安装包\spikeinterface-main\spikeinterface-main"
-        }
-        job_dict.update(params)
-        sorting = ss.run_sorter(**job_dict)
-        # 给各个unit添加前缀 "raw_unit_"
-        if len(sorting.unit_ids) > 0:
-            new_ids = [f"raw_unit_{i}" for i in range(1, len(sorting.unit_ids) + 1)]
-            sorting = sorting.rename_units(new_ids)
-        sorting.save(folder=output_folder, overwrite=True)
-        return sorting
+
+        group_values = recording.get_property("group")
+        print(f"按 {len(set(group_values.tolist()))} 个 shank 分组独立运行 {sorter_name}")
+
+        # sorter 的中间结果放入临时目录；最终 Sorting 保存完成后自动清理。
+        with TemporaryDirectory(
+            prefix=f"{output_folder.name}_shank_sorting_",
+            dir=output_folder.parent,
+        ) as sorter_working_folder:
+            sorting = ss.run_sorter_by_property(
+                sorter_name=sorter_name,
+                recording=recording,
+                grouping_property="group",
+                folder=sorter_working_folder,
+                engine="loop",
+                verbose=True,
+                **params,
+            )
+
+            # 给所有 Unit 统一添加前缀，避免不同 shank 的 Unit ID 冲突。
+            if len(sorting.unit_ids) > 0:
+                new_ids = [f"raw_unit_{i}" for i in range(1, len(sorting.unit_ids) + 1)]
+                sorting = sorting.rename_units(new_ids)
+            sorting = sorting.save(folder=output_folder,overwrite=True,)
+            return sorting
 
     def batch_sorting(self, input_folder_list: list[str], output_base_folder, sorter_name, params=None, n_jobs=1):
         """
         批量排序
         注意保存的verbose_path路径不能在同一个子文件夹下，必须是不同的倒数第二级文件夹，不然它们的元文件会串起来进而报错
         Args:
-            input_folder_list: 总文件夹，要求文件夹下是一群白化后的recording的数据
+            input_folder_list: 总文件夹，要求文件夹下是一组预处理后的 Recording
             output_base_folder: 输出结果文件夹，包括verbose和sorting结果
             sorter_name: 排序器名称
             params: 排序参数
+
+        Notes
+        -----
+        SpikeInterface 0.104.8 的 run_sorter_jobs() 没有 grouping_property 参数。
+        为保留一次性批量调度及 WSL/容器效率，本函数不拆分 shank，也不改为
+        Python 循环；需要按 shank 硬隔离时请使用 perform_sorting()。
         """
         # 延迟导入 spikeinterface
         import spikeinterface as si
@@ -455,7 +713,7 @@ class SpikeSortingPipeline:
         import yyl_utils as yyl
 
         if params is None:
-            params = self.get_default_sorting_params(sorter_name)
+            params = self._get_current_sorting_params_dict(sorter_name)
 
         job_list = []
         for index, folder_path in enumerate(input_folder_list):
@@ -485,7 +743,8 @@ class SpikeSortingPipeline:
         sortings = ss.run_sorter_jobs(
             job_list=job_list,
             engine='joblib',
-            engine_kwargs={'n_jobs': n_jobs}
+            engine_kwargs={'n_jobs': n_jobs},
+            return_output=True
         )
 
         if sortings is not None:
@@ -506,26 +765,42 @@ class SpikeSortingPipeline:
     def create_analyzer(self, recording_folder, sorting_folder, output_folder, extensions_dict=None,
                         compute=True, template_metrics_path=None, qm_path=None, n_jobs=1):
         """
-        创建排序分析器
+        创建 SortingAnalyzer、计算扩展并导出指标表格。
 
-        Args:
-            recording_folder: 记录数据文件夹
-            sorting_folder: 排序结果文件夹
-            output_folder: 输出分析器文件夹
-            extensions_dict: 扩展计算参数字典，键为扩展名，值为该扩展的参数。
-                如果为None，则使用默认扩展参数（见 get_default_extensions_dict 方法）
-            compute: 是否立即计算扩展，默认为True。
-                如果为False，则只创建分析器但不计算扩展，需后续手动调用 analyzer.compute()
-            template_metrics_path: 是否保存模板矩阵（template_metrics）到Excel文件，默认为None。
-                如果传入路径，则保存质量指标矩阵到该路径
-            qm_path: 是否保存质量指标（quality_metrics）到Excel文件，默认为None。
-                如果传入路径，则保存质量指标矩阵到该路径
-            n_jobs: 并行计算使用的CPU核心数，默认为1。
-                设置为-1表示使用所有可用核心
+        Parameters
+        ----------
+        recording_folder : str | Path
+            预处理后的 Recording 文件夹。
+        sorting_folder : str | Path
+            spike sorting 结果文件夹。
+        output_folder : str | Path
+            SortingAnalyzer 的保存文件夹。
+        extensions_dict : dict | None, default: None
+            需要计算的扩展及参数；None 使用 _get_current_extensions_params()。
+        compute : bool, default: True
+            是否立即计算扩展。False 时仅创建 Analyzer。
+        template_metrics_path : str | Path | None, default: None
+            template_metrics Excel 输出路径。表格会增加 ``max_channel`` 列，
+            该列使用 median template 的 peak-to-peak 最大通道。
+        qm_path : str | Path | None, default: None
+            quality_metrics Excel 输出路径。
+        n_jobs : int, default: 1
+            扩展计算使用的并行任务数；-1 表示使用全部可用核心。
+
+        Returns
+        -------
+        SortingAnalyzer
+            已创建的 Analyzer。计算 template_metrics 时，其结果中也会保存
+            ``max_channel`` 列。
         """
         # 延迟导入 spikeinterface
         import spikeinterface as si
+        from spikeinterface.core import get_template_extremum_channel
         import yyl_utils as yyl
+        from pathlib import Path
+
+        if extensions_dict is None:
+            extensions_dict = self._get_current_extensions_params()
 
         yyl.check_delete_exists_path(output_folder)
 
@@ -541,17 +816,63 @@ class SpikeSortingPipeline:
             sorting,
             recording,
             format="binary_folder",
-            folder=output_folder
+            folder=output_folder,
+            sparse=True,
+            method="by_property",
+            by_property="group",
         )
 
         # 一次性计算所有扩展
         if compute:
             analyzer.compute(extensions_dict, n_jobs=n_jobs)
-            if template_metrics_path is not None:
-                ((analyzer.extensions['template_metrics'].data['metrics']).
-                 to_excel(self.output_paths.template_metrics_path, index=True))
-            if qm_path is not None:
-                (analyzer.extensions['quality_metrics'].data['metrics']).to_excel(qm_path,index=True)
+
+            if analyzer.has_extension("template_metrics"):
+                if not analyzer.has_extension("templates"):
+                    raise ValueError(
+                        "计算 max_channel 需要 templates 扩展，请将 templates 加入 "
+                        "extensions_dict"
+                    )
+
+                # 使用官方接口按中位模板的峰峰值选择每个 Unit 的最大通道。
+                # operator="median" 要求 templates 中存在 median；默认配置会提前
+                # 计算它，自定义配置则需要同时保留 waveforms 以便按需计算。
+                try:
+                    peak_channels = get_template_extremum_channel(
+                        analyzer,
+                        peak_sign="both",
+                        mode="peak_to_peak",
+                        outputs="id",
+                        operator="median",
+                    )
+                except (KeyError, ValueError) as exc:
+                    raise ValueError(
+                        "无法用 median template 计算 max_channel。请确保 "
+                        "extensions_dict 同时计算 random_spikes、waveforms 和 "
+                        "templates，并在 templates 的 operators 中加入 'median'。"
+                    ) from exc
+
+                template_metrics_extension = analyzer.get_extension("template_metrics")
+                template_metrics = template_metrics_extension.get_data().copy()
+                template_metrics["max_channel"] = [
+                    peak_channels[unit_id] for unit_id in template_metrics.index
+                ]
+
+                # 将自定义列写回扩展并保存，使重新加载 Analyzer 后仍能读取。
+                template_metrics_extension.data["metrics"] = template_metrics
+                template_metrics_extension.save()
+
+                if template_metrics_path is not None:
+                    template_metrics_path = Path(template_metrics_path)
+                    template_metrics_path.parent.mkdir(parents=True, exist_ok=True)
+                    template_metrics.to_excel(template_metrics_path, index=True)
+
+            if qm_path is not None and analyzer.has_extension("quality_metrics"):
+                qm_path = Path(qm_path)
+                qm_path.parent.mkdir(parents=True, exist_ok=True)
+                analyzer.get_extension("quality_metrics").get_data().to_excel(
+                    qm_path,
+                    index=True,
+                )
 
         return analyzer
 
@@ -563,7 +884,6 @@ class SpikeSortingPipeline:
         """
         # 延迟导入 spikeinterface
         import spikeinterface as si
-        import numpy as np
         import pandas as pd
 
         def screen_units(df_qm_metrics):
@@ -588,31 +908,6 @@ class SpikeSortingPipeline:
                     screen_dict["sorting_quality"].append("bad")
             return screen_dict
 
-        def get_unit_max_channel(sorting_analyzer):
-            """获取所有unit的最大的channel位置"""
-            # 获取所有单元的ID
-            unit_ids = sorting_analyzer.unit_ids
-            # 获取探针上所有触点的物理坐标位置
-            positions = sorting_analyzer.get_probe().contact_positions
-            # 获取每个单元的物理位置坐标，只取与触点坐标维度相同的列
-            unit_locations = sorting_analyzer.extensions["unit_locations"].get_data()[:, 0:positions.shape[-1]]
-            # 获取所有通道的ID
-            channel_ids = sorting_analyzer.channel_ids
-            # 初始化存储每个单元对应最大通道的列表
-            unit_channel_ids = []
-            # 遍历每个单元的位置
-            for unit_location in unit_locations:
-                # 计算当前单元位置到每个触点的欧氏距离
-                distances = [np.sqrt(np.sum((unit_location - position) ** 2)) for position in positions]
-                # 找到距离最近的触点索引（即最大通道对应的触点）
-                channel_idx = np.argmin(distances)
-                # 根据索引获取对应的通道ID并添加到列表中
-                unit_channel_ids.append(channel_ids[channel_idx])
-            # 创建包含单元ID和对应最大通道的字典
-            channel_dict = {"unit_ids": unit_ids, "max_channel": unit_channel_ids}
-
-            return channel_dict
-
         def get_units_classified(df_qm_metrics, df_template_metrics):
             """
             根据波形特征和放电率对神经元进行分类
@@ -636,8 +931,14 @@ class SpikeSortingPipeline:
             # 判断神经元的兴奋/抑制类型
             if classify_dict["unit_ids"]:
                 for unit_id in classify_dict["unit_ids"]:
-                    # 将peak_to_valley从秒转换为毫秒进行比较
-                    peak_to_valley_ms = df_template_metrics.loc[unit_id, 'peak_to_valley'] * 1000
+                    # 新版 SpikeInterface 使用 peak_to_trough_duration；兼容旧表格的
+                    # peak_to_valley 列，二者含义都是波峰到波谷的时间间隔（秒）。
+                    duration_column = (
+                        "peak_to_trough_duration"
+                        if "peak_to_trough_duration" in df_template_metrics.columns
+                        else "peak_to_valley"
+                    )
+                    peak_to_valley_ms = df_template_metrics.loc[unit_id, duration_column] * 1000
                     firing_rate = df_qm_metrics.loc[unit_id, 'firing_rate']
 
                     # 锥体神经元：宽波形 + 低频放电
@@ -657,9 +958,6 @@ class SpikeSortingPipeline:
         df_qm_metrics = sorting_analyzer.extensions["quality_metrics"].get_data()
         # 执行单元筛选，获取质量标记
         renew_dict = screen_units(df_qm_metrics)
-        # 获取unit所在通道的位置
-        channel_dict = get_unit_max_channel(sorting_analyzer)
-        renew_dict = {**renew_dict, **channel_dict}
 
         # 如果需要分类神经元类型
         if classify_units:
@@ -709,9 +1007,49 @@ class SpikeSortingPipeline:
         sorting_analyzer.sorting.set_property("quality_mua", labels_sua_mua.iloc[:, 0])
         sorting_analyzer.sorting.set_property("ratio_mua", labels_sua_mua.iloc[:, 1])
 
-        # 保存
-        yyl.check_delete_exists_path(analyzer_folder)
-        sorting_analyzer.save_as(format="binary_folder", folder=analyzer_folder)
+        # 先保存到同级临时目录；保存成功后再替换原 Analyzer，避免保存失败时
+        # 原分析结果已经被删除。若替换过程失败，则尝试恢复原目录。
+        from pathlib import Path
+        import shutil
+        import tempfile
+        import uuid
+
+        analyzer_path = Path(analyzer_folder)
+        analyzer_path.parent.mkdir(parents=True, exist_ok=True)
+        temporary_path = Path(
+            tempfile.mkdtemp(
+                prefix=f"{analyzer_path.name}_updated_",
+                dir=analyzer_path.parent,
+            )
+        )
+        # save_as 要求目标目录不存在。
+        shutil.rmtree(temporary_path)
+        backup_path = analyzer_path.parent / (
+            f"{analyzer_path.name}_backup_{uuid.uuid4().hex}"
+        )
+        replacement_succeeded = False
+
+        try:
+            sorting_analyzer.save_as(
+                format="binary_folder",
+                folder=temporary_path,
+            )
+            if analyzer_path.exists():
+                shutil.move(str(analyzer_path), str(backup_path))
+            shutil.move(str(temporary_path), str(analyzer_path))
+            replacement_succeeded = True
+        except Exception:
+            # 新目录如果已经移动到目标位置，先移除它，再恢复旧目录。
+            if analyzer_path.exists() and backup_path.exists():
+                shutil.rmtree(analyzer_path)
+            if backup_path.exists() and not analyzer_path.exists():
+                shutil.move(str(backup_path), str(analyzer_path))
+            raise
+        finally:
+            if temporary_path.exists():
+                shutil.rmtree(temporary_path)
+            if replacement_succeeded and backup_path.exists():
+                shutil.rmtree(backup_path)
 
         print("Noise labels:")
         print(labels_noise)
@@ -720,187 +1058,393 @@ class SpikeSortingPipeline:
 
         return labels_noise, labels_sua_mua
 
-    def visualize_results(self, analyzer_folder, fig_folder=None):
+    def visualize_results(
+        self,
+        analyzer_folder,
+        fig_folder=None,
+        max_waveforms_html=500,
+        max_waveforms_png=500,
+    ):
         """
-        可视化结果
-        Args:
-            analyzer_folder: 分析器文件夹
-            fig_folder: 结果保存路径文件夹
+        为每个 Unit 生成 waveform、自相关及二者合并图。
+
+        波形图只展示峰峰值最大的通道。横轴是相对 spike 对齐点的时间，单位为
+        毫秒；纵轴是绝对电压，单位为微伏。PNG 中 waveform 子图的纵轴固定为
+        -200 到 200 μV；HTML 保留自动缩放。每个 Unit 只保留两个 HTML 和一个 PNG。
+
+        Parameters
+        ----------
+        analyzer_folder : str | Path
+            已计算 ``waveforms`` 和 ``correlograms`` 扩展的 Analyzer 文件夹。
+        fig_folder : str | Path | None, default: None
+            图表输出目录；None 表示只打印 Unit 数量，不生成文件。
+        max_waveforms_html : int, default: 500
+            waveform HTML 最多展示的单次波形数。Plotly 会把这些波形合并成一个
+            WebGL 数据对象；如果显卡性能有限，仍可将该值调小。
+        max_waveforms_png : int, default: 500
+            合并 PNG 最多展示的单次波形数。
+
+        Returns
+        -------
+        None
+
+        Notes
+        -----
+        中位波形始终使用 Analyzer 中该 Unit 的全部 waveforms 计算，不受展示数量限制。
+        HTML 使用 Plotly WebGL，并把多条 waveform 合并为一个 trace，避免 mpld3
+        为 500 条曲线创建大量 SVG 对象。PNG 是静态图片，最多保留 500 条。
         """
-        # 延迟导入 spikeinterface
-        import spikeinterface as si
-        import spikeinterface.widgets as sw
-        import yyl_utils as yyl
+        import numpy as np
         import matplotlib.pyplot as plt
-        import mpld3
+        import plotly.graph_objects as go
+        import spikeinterface as si
         from pathlib import Path
 
+        if not isinstance(max_waveforms_html, int) or max_waveforms_html <= 0:
+            raise ValueError("max_waveforms_html 必须是大于 0 的整数")
+        if not isinstance(max_waveforms_png, int) or max_waveforms_png <= 0:
+            raise ValueError("max_waveforms_png 必须是大于 0 的整数")
+
         analyzer = si.load(analyzer_folder)
-        # 打印基本信息
         unit_counts = analyzer.sorting.count_num_spikes_per_unit()
         print("unit_id:spike数")
-        print({f'{x}': int(y) for (x, y) in unit_counts.items()})
-        print(f"各unit通道定位：{analyzer.extensions['unit_locations'].data}")
+        print({f"{unit_id}": int(count) for unit_id, count in unit_counts.items()})
 
-        # 绘制每个神经元的波形
-        if fig_folder and len(analyzer.unit_ids) > 0:
-            yyl.make_sure_folder_exist(fig_folder)
-            # 创建html子文件夹
-            html_folder = Path(fig_folder) / "html"
-            yyl.make_sure_folder_exist(html_folder)
-            print("开始生成可视化图表...")
+        if fig_folder is None or len(analyzer.unit_ids) == 0:
+            return
 
-            for unit_id in analyzer.unit_ids:
-                unit_colors = {unit_id: 'orangered'}
-                print(f"  处理 Unit {unit_id}...")
+        required_extensions = ("waveforms", "correlograms")
+        missing_extensions = [
+            name for name in required_extensions if not analyzer.has_extension(name)
+        ]
+        if missing_extensions:
+            raise ValueError(
+                f"Analyzer 缺少扩展 {missing_extensions}，请先在 create_analyzer() 中计算"
+            )
 
-                # 存储每个子图的figure，用于合并
-                subfigs = []
+        fig_folder = Path(fig_folder)
+        html_folder = fig_folder / "html"
+        fig_folder.mkdir(parents=True, exist_ok=True)
+        html_folder.mkdir(parents=True, exist_ok=True)
 
-                # 1. Unit Waveforms
-                fig1, ax1 = plt.subplots(figsize=(10, 8))
-                sw.plot_unit_waveforms(
-                    analyzer,
-                    unit_ids=[unit_id],
-                    unit_colors=unit_colors,
-                    max_spikes_per_unit=500,
-                    plot_templates=True,
-                    plot_channels=True,
-                    same_axis=True,
-                    backend='matplotlib',
-                    plot_legend=False,
-                    ax=ax1,
+        waveform_extension = analyzer.get_extension("waveforms")
+        correlogram_extension = analyzer.get_extension("correlograms")
+        all_correlograms, correlogram_bins_ms = correlogram_extension.get_data()
+        sampling_frequency = float(analyzer.sampling_frequency)
+
+        def select_evenly(waveforms, max_count):
+            """
+            在全部 waveforms 中均匀抽样，避免只展示记录开始处的 spikes。
+
+            Parameters
+            ----------
+            waveforms : np.ndarray
+                形状为 ``(波形数, 时间点数)`` 的数组。
+            max_count : int
+                最多保留的波形数量。
+
+            Returns
+            -------
+            np.ndarray
+                均匀抽样后的波形；数量不足时返回原数组。
+            """
+            if waveforms.shape[0] <= max_count:
+                return waveforms
+            indices = np.linspace(0, waveforms.shape[0] - 1, max_count, dtype=int)
+            return waveforms[indices]
+
+        def get_peak_channel_waveforms_uv(unit_id):
+            """
+            获取峰峰值最大通道的全部波形，并确保数值单位为微伏。
+
+            Parameters
+            ----------
+            unit_id : int | str
+                需要提取波形的 Unit ID。
+
+            Returns
+            -------
+            waveforms_uv : np.ndarray
+                形状为 ``(波形数, 时间点数)`` 的微伏波形。
+            median_waveform_uv : np.ndarray
+                由全部波形计算的中位波形。
+            peak_channel_id : int | str
+                峰峰值最大的通道 ID。
+            time_ms : np.ndarray
+                相对于 spike 对齐点的时间轴，单位为毫秒。
+
+            Raises
+            ------
+            ValueError
+                Unit 没有波形，或原始 ADC 值无法换算为微伏时抛出。
+            """
+            unit_waveforms = np.asarray(
+                waveform_extension.get_waveforms_one_unit(unit_id, force_dense=False)
+            )
+            if unit_waveforms.ndim != 3 or unit_waveforms.shape[0] == 0:
+                raise ValueError(f"Unit {unit_id} 没有可用于绘图的 waveforms")
+
+            if analyzer.sparsity is None:
+                channel_indices = np.arange(len(analyzer.channel_ids))
+            else:
+                channel_indices = analyzer.sparsity.unit_id_to_channel_indices[unit_id]
+
+            # 中位数比均值更不容易受到少数异常波形影响。
+            median_waveforms = np.nanmedian(unit_waveforms, axis=0)
+            peak_to_peak = np.ptp(median_waveforms, axis=0)
+            local_peak_index = int(np.nanargmax(peak_to_peak))
+            recording_channel_index = int(channel_indices[local_peak_index])
+            peak_channel_id = analyzer.channel_ids[recording_channel_index]
+            waveforms_uv = unit_waveforms[:, :, local_peak_index].astype(
+                "float32", copy=False
+            )
+
+            # 新 Analyzer 默认已经以 μV 保存 waveforms。兼容旧 Analyzer：若保存的是
+            # ADC 值，则使用对应通道的 gain_to_uV 和 offset_to_uV 显式换算。
+            if not analyzer.return_in_uV:
+                recording = analyzer.recording
+                if recording is None or not recording.has_scaleable_traces():
+                    raise ValueError(
+                        "Analyzer 中的 waveforms 不是 μV，且 Recording 缺少 "
+                        "gain_to_uV/offset_to_uV，无法转换为绝对微伏数值"
+                    )
+                gain_to_uv = recording.get_channel_gains()[recording_channel_index]
+                offset_to_uv = recording.get_channel_offsets()[recording_channel_index]
+                waveforms_uv = waveforms_uv * gain_to_uv + offset_to_uv
+
+            median_waveform_uv = np.nanmedian(waveforms_uv, axis=0)
+            sample_indices = np.arange(waveforms_uv.shape[1]) - waveform_extension.nbefore
+            time_ms = sample_indices / sampling_frequency * 1000.0
+            return waveforms_uv, median_waveform_uv, peak_channel_id, time_ms
+
+        def plot_waveforms(
+            axis,
+            time_ms,
+            shown_waveforms_uv,
+            median_waveform_uv,
+            unit_id,
+            peak_channel_id,
+            total_count,
+        ):
+            """将单次波形和由全部数据计算的中位波形绘制到指定坐标轴。"""
+            for waveform in shown_waveforms_uv:
+                axis.plot(
+                    time_ms,
+                    waveform,
+                    color="0.35",
+                    alpha=0.14,
+                    linewidth=0.55,
                 )
-                plt.tight_layout()
-                # 保存HTML
-                mpld3.save_html(fig1, str(html_folder / f"{unit_id}_waveforms.html"))
-                subfigs.append(fig1)  # 添加到列表
 
-                # 2. Waveform Density Map (如果存在)
-                if analyzer.has_extension("waveforms"):
-                    fig2, ax2 = plt.subplots(figsize=(8, 8))
-                    sw.plot_unit_waveforms_density_map(
-                        analyzer,
-                        unit_ids=[unit_id],
-                        unit_colors=unit_colors,
-                        backend='matplotlib',
-                        ax=ax2
+            axis.plot(
+                time_ms,
+                median_waveform_uv,
+                color="orangered",
+                linewidth=2.2,
+                label="Median waveform (all)",
+            )
+
+            # PNG 需要在不同 Unit 之间直接比较振幅，因此统一使用固定纵轴。
+            # 超出范围的部分会在 PNG 中被裁剪，但 HTML 仍可自动缩放和交互查看。
+            axis.set_ylim(-200.0, 200.0)
+            axis.plot(
+                [0.0, 0.0],
+                [-200.0, 200.0],
+                color="steelblue",
+                linestyle="--",
+                linewidth=1.0,
+            )
+
+            axis.set_title(
+                f"Unit {unit_id} | peak channel {peak_channel_id} | "
+                f"shown {shown_waveforms_uv.shape[0]}/{total_count}"
+            )
+            axis.set_xlabel("Time relative to spike (ms)")
+            axis.set_ylabel("Voltage (μV)")
+            axis.grid(alpha=0.18)
+            axis.legend(loc="best")
+
+        def plot_autocorrelogram(axis, unit_id):
+            """将指定 Unit 的自相关计数绘制到指定坐标轴。"""
+            unit_index = analyzer.sorting.id_to_index(unit_id)
+            autocorrelogram = all_correlograms[unit_index, unit_index]
+            axis.bar(
+                correlogram_bins_ms[:-1],
+                autocorrelogram,
+                width=np.diff(correlogram_bins_ms),
+                align="edge",
+                color="orangered",
+                edgecolor="none",
+            )
+            axis.set_title(f"Unit {unit_id} autocorrelogram")
+            axis.set_xlabel("Lag (ms)")
+            axis.set_ylabel("Spike-pair count")
+            axis.grid(axis="y", alpha=0.18)
+
+        def create_waveform_html_figure(
+            time_ms,
+            shown_waveforms_uv,
+            median_waveform_uv,
+            unit_id,
+            peak_channel_id,
+            total_count,
+        ):
+            """
+            创建 WebGL waveform 图，并把多条波形合并成一个 Plotly trace。
+
+            将所有曲线放进一个 trace 能避免浏览器维护数百个 SVG/JavaScript 对象；
+            每条曲线之间插入 NaN，因此它们仍会显示为互相独立的波形。
+            """
+            waveform_count, sample_count = shown_waveforms_uv.shape
+            segmented_time = np.full(
+                (waveform_count, sample_count + 1),
+                np.nan,
+                dtype="float32",
+            )
+            segmented_voltage = np.full_like(segmented_time, np.nan)
+            segmented_time[:, :sample_count] = time_ms
+            segmented_voltage[:, :sample_count] = shown_waveforms_uv
+
+            figure = go.Figure()
+            figure.add_trace(
+                go.Scattergl(
+                    x=segmented_time.ravel(),
+                    y=segmented_voltage.ravel(),
+                    mode="lines",
+                    line={"color": "rgba(80, 80, 80, 0.16)", "width": 0.7},
+                    name="Single waveforms",
+                    hoverinfo="skip",
+                    connectgaps=False,
+                )
+            )
+            figure.add_trace(
+                go.Scattergl(
+                    x=time_ms,
+                    y=median_waveform_uv,
+                    mode="lines",
+                    line={"color": "orangered", "width": 3},
+                    name="Median waveform (all)",
+                )
+            )
+            figure.add_vline(
+                x=0.0,
+                line_width=1,
+                line_dash="dash",
+                line_color="steelblue",
+            )
+            figure.update_layout(
+                title=(
+                    f"Unit {unit_id} | peak channel {peak_channel_id} | "
+                    f"shown {waveform_count}/{total_count}"
+                ),
+                xaxis_title="Time relative to spike (ms)",
+                yaxis_title="Voltage (μV)",
+                template="plotly_white",
+                hovermode="x unified",
+                width=1000,
+                height=600,
+            )
+            return figure
+
+        def create_autocorrelogram_html_figure(unit_id):
+            """创建 Plotly 自相关直方图。"""
+            unit_index = analyzer.sorting.id_to_index(unit_id)
+            autocorrelogram = all_correlograms[unit_index, unit_index]
+            bin_centers_ms = (
+                correlogram_bins_ms[:-1] + correlogram_bins_ms[1:]
+            ) / 2.0
+            figure = go.Figure(
+                data=[
+                    go.Bar(
+                        x=bin_centers_ms,
+                        y=autocorrelogram,
+                        width=np.diff(correlogram_bins_ms),
+                        marker_color="orangered",
+                        hovertemplate="Lag: %{x:.2f} ms<br>Count: %{y}<extra></extra>",
                     )
-                    plt.tight_layout()
-                    # 保存HTML
-                    mpld3.save_html(fig2, str(html_folder / f"{unit_id}_density.html"))
-                    # subfigs.append(fig2)  # 添加到列表
-                else:
-                    # 如果不存在，创建一个空白占位图
-                    fig2, ax2 = plt.subplots(figsize=(8, 8))
-                    ax2.text(0.5, 0.5, 'No Density Map', ha='center', va='center', fontsize=20)
-                    ax2.set_xticks([])
-                    ax2.set_yticks([])
-                    plt.tight_layout()
-                    # subfigs.append(fig2)
+                ]
+            )
+            figure.update_layout(
+                title=f"Unit {unit_id} autocorrelogram",
+                xaxis_title="Lag (ms)",
+                yaxis_title="Spike-pair count",
+                template="plotly_white",
+                width=800,
+                height=500,
+            )
+            return figure
 
-                # 3. Auto Correlograms (如果存在)
-                if analyzer.has_extension("correlograms"):
-                    fig3, ax3 = plt.subplots(figsize=(8, 6))
-                    sw.plot_autocorrelograms(
-                        analyzer,
-                        unit_ids=[unit_id],
-                        unit_colors=unit_colors,
-                        backend='matplotlib',
-                        ax=ax3
-                    )
-                    plt.tight_layout()
-                    # 保存HTML
-                    mpld3.save_html(fig3, str(html_folder / f"{unit_id}_autocorr.html"))
-                    subfigs.append(fig3)  # 添加到列表
-                else:
-                    # 如果不存在，创建一个空白占位图
-                    fig3, ax3 = plt.subplots(figsize=(8, 6))
-                    ax3.text(0.5, 0.5, 'No Autocorrelogram', ha='center', va='center', fontsize=20)
-                    ax3.set_xticks([])
-                    ax3.set_yticks([])
-                    plt.tight_layout()
-                    subfigs.append(fig3)
+        print("开始生成可视化图表...")
+        for unit_id in analyzer.unit_ids:
+            print(f"  处理 Unit {unit_id}...")
+            waveforms_uv, median_waveform_uv, peak_channel_id, time_ms = (
+                get_peak_channel_waveforms_uv(unit_id)
+            )
+            total_count = waveforms_uv.shape[0]
+            html_waveforms = select_evenly(waveforms_uv, max_waveforms_html)
+            png_waveforms = select_evenly(waveforms_uv, max_waveforms_png)
 
-                # 4. Amplitudes (如果存在) - 这个图我们单独保存PNG，不合并
-                if analyzer.has_extension("spike_amplitudes"):
-                    fig4, (ax4a, ax4b) = plt.subplots(1, 2, figsize=(12, 5))
-                    sw.plot_amplitudes(
-                        analyzer,
-                        unit_ids=[unit_id],
-                        unit_colors=unit_colors,
-                        plot_histograms=True,
-                        backend='matplotlib',
-                        axes=[ax4a, ax4b]
-                    )
-                    plt.tight_layout()
-                    # 保存HTML
-                    mpld3.save_html(fig4, str(html_folder / f"{unit_id}_amplitudes.html"))
-                    # 保存单独的PNG（不合并）
-                    # fig4.savefig(str(fig_folder / f"{unit_id}_amplitudes.png"), dpi=300, bbox_inches='tight')
-                    plt.close(fig4)
+            # 清理旧版本可能遗留、但新版本不再需要的图表。
+            for stale_path in (
+                html_folder / f"{unit_id}_density.html",
+                html_folder / f"{unit_id}_amplitudes.html",
+            ):
+                if stale_path.exists():
+                    stale_path.unlink()
 
-                # --- 合并前3个图为一张PNG（1行3列） ---
-                # 计算合并图的大小
-                fig_combined, axes = plt.subplots(1, len(subfigs))
+            # 1. waveform HTML：WebGL 加单 trace，适合数百条 waveform。
+            waveform_html_figure = create_waveform_html_figure(
+                time_ms,
+                html_waveforms,
+                median_waveform_uv,
+                unit_id,
+                peak_channel_id,
+                total_count,
+            )
+            waveform_html_figure.write_html(
+                html_folder / f"{unit_id}_waveforms.html",
+                include_plotlyjs="cdn",
+                full_html=True,
+                config={"scrollZoom": True, "displaylogo": False},
+            )
 
-                # 将每个子图的内容复制到合并图中
-                for i, subfig in enumerate(subfigs):
-                    # 获取子图的内容
-                    subfig.canvas.draw()
+            # 2. autocorrelogram HTML。
+            autocorr_html_figure = create_autocorrelogram_html_figure(unit_id)
+            autocorr_html_figure.write_html(
+                html_folder / f"{unit_id}_autocorr.html",
+                include_plotlyjs="cdn",
+                full_html=True,
+                config={"scrollZoom": True, "displaylogo": False},
+            )
 
-                    # 提取子图的图像数据
-                    subfig.tight_layout()
-                    subfig.canvas.draw()
-
-                    # 将子图转换为图像数组
-                    import numpy as np
-                    from matplotlib.backends.backend_agg import FigureCanvasAgg
-                    canvas = FigureCanvasAgg(subfig)
-                    canvas.draw()
-                    width, height = subfig.get_size_inches() * subfig.dpi
-                    image = np.frombuffer(canvas.tostring_rgb(), dtype='uint8')
-                    image = image.reshape(int(height), int(width), 3)
-
-                    # 显示在合并图的对应位置
-                    axes[i].imshow(image)
-                    axes[i].set_xticks([])
-                    axes[i].set_yticks([])
-                    axes[i].set_title(['Waveforms', 'Autocorrelogram', 'Density Map'][i], fontsize=14)
-
-                plt.tight_layout()
-                # 保存合并的PNG
-                fig_combined.savefig(str(fig_folder / f"{unit_id}_abstract.png"), dpi=300, bbox_inches='tight')
-                plt.close(fig_combined)
-
-                # 关闭所有子图
-                for fig in subfigs:
-                    plt.close(fig)
-
-        # 以下为注释的可选可视化功能
-        # sw.plot_all_amplitudes_distributions(sorting_analyser=sorting_analyser)
-        # sw.plot_amplitudes(sorting_analyser=sorting_analyser)
-        # 绘制每个单元的自相关图
-        # sw.plot_autocorrelograms(sorting_analyser=sorting_analyser)
-        # 绘制神经元对之间的互相关图
-        # sw.plot_crosscorrelograms(sorting_analyser=sorting_analyser)
-        # 绘制ISI分布图
-        # sw.plot_isi_distribution(sorting_analyser=sorting_analyser)
-        # sw.plot_quality_metrics(sorting_analyser=sorting_analyser)
-        # sw.plot_rasters(sorting_analyser=sorting_analyser)
-        # sw.plot_spikes_on_traces()
-        # sw.plot_template_metrics()
-        # sw.plot_template_similarity()
-        # sw.plot_traces()
-        # sw.plot_unit_presence()
-        # sw.plot_unit_probe_map()
-        # sw.plot_unit_templates()
-        # sw.plot_unit_waveforms_density_map()
-        # sw.plot_unit_waveforms()
-
-        # 用于sorting方法对比
-        # 可视化两个排序结果之间单元的匹配关系，生成一个一致性矩阵（AgreementMatrix） 或混淆矩阵（ConfusionMatrix）。
-        # sw.plot_agreement_matrix
+            # 3. 直接绘制两个子图，避免先截图再拼接造成的额外内存开销。
+            combined_figure, (waveform_axis, autocorr_axis) = plt.subplots(
+                1, 2, figsize=(15, 5.5)
+            )
+            try:
+                plot_waveforms(
+                    waveform_axis,
+                    time_ms,
+                    png_waveforms,
+                    median_waveform_uv,
+                    unit_id,
+                    peak_channel_id,
+                    total_count,
+                )
+                plot_autocorrelogram(autocorr_axis, unit_id)
+                combined_figure.subplots_adjust(
+                    left=0.07,
+                    right=0.98,
+                    bottom=0.13,
+                    top=0.89,
+                    wspace=0.25,
+                )
+                combined_figure.savefig(
+                    fig_folder / f"{unit_id}_abstract.png",
+                    dpi=300,
+                )
+            finally:
+                plt.close(combined_figure)
 
     def export_to_phy(self, analyzer_folder, output_folder):
         """
@@ -1027,11 +1571,12 @@ class SpikeSortingPipeline:
             def __exit__(self, exc_type, exc_val, exc_tb):
                 self.disconnect()
 
-        pipeline = _MatlabPipeline()
-        success, result, error_msg = pipeline.run_pipeline(
-            str(matlab_function_path),
-            str(phy_folder)
-        )
+        # 使用上下文管理器，确保 MATLAB Engine 无论成功还是异常都会关闭。
+        with _MatlabPipeline() as pipeline:
+            success, result, error_msg = pipeline.run_pipeline(
+                str(matlab_function_path),
+                str(phy_folder)
+            )
 
         if success:
             print("MATLAB管道执行成功!")
@@ -1042,59 +1587,132 @@ class SpikeSortingPipeline:
             print(f"MATLAB管道执行失败: {error_msg}")
             return None
 
-    def run_pipeline(self, probe: Probe = None, config=None, traces_config=None, n_jobs=-1):
+    def run_pipeline(
+        self,
+        probe: Probe = None,
+        config=None,
+        traces_config=None,
+        n_jobs=-1,
+        run_until_step=None,
+    ):
         """
-        运行完整的spike sorting处理管道
+        按顺序运行 spike sorting 全流程，并可在指定步骤完成后停止。
 
-        Args:
-            config: 配置字典，包含管道运行的所有路径参数和设置
-                - sorter_name (str, optional): 使用的spike sorter名称，默认值为'mountainsort5'
-                - sorting_params (dict, optional): sorter-specific的排序参数，默认使用get_default_sorting_params(sorter_name)返回的参数
-                - extensions_dict (dict, optional): 扩展计算参数字典，默认使用get_default_extensions_dict()返回的参数
-                - run_cell_explorer (bool, optional): 是否在管道完成后运行CellExplorer，默认值为False
+        Parameters
+        ----------
+        probe : Probe | None, default: None
+            探针结构。可以通过 ``SpikeSortingPipeline.get_probe()`` 创建。
+        config : dict | None, default: None
+            管道配置。支持以下键：
 
-            probe: 定义探针，可以用self.get_probe获得
+            - ``sorter_name``：sorter 名称，默认 ``"mountainsort5"``。
+            - ``sorting_params``：sorter 参数；未提供时读取该 sorter 的默认值。
+            - ``extensions_dict``：Analyzer 扩展参数；None 使用本项目默认配置。
+            - ``preprocess_pipeline_dict``：预处理 Pipeline；None 使用项目默认
+              流程，空字典表示跳过所有预处理操作。
+            - ``classify_units``：是否推断细胞类型，默认 True。
+            - ``max_waveforms_html``：每个 Unit 的 HTML 最多绘制多少条波形，
+              默认 500。
+            - ``max_waveforms_png``：每个 Unit 的 PNG 最多绘制多少条波形，
+              默认 500。
+            - ``run_cell_explorer``：是否运行 CellExplorer，默认 False。
+            - ``run_until_step``：也可在 config 中指定停止步骤；函数参数
+              ``run_until_step`` 的优先级更高。
+        traces_config : dict | None, default: None
+            从 NumPy 数组创建 Recording 时使用。必须包含 ``traces``、``fs``、
+            ``chan_ids``；可选 ``metadata_folder`` 和 ``properties``。未提供时
+            从 ``self.input_file`` 指向的 PLX 文件读取。
+        n_jobs : int, default: -1
+            支持并行的步骤所使用的任务数；-1 表示使用全部可用核心。
+        run_until_step : int | str | None, default: None
+            控制管道运行到哪个步骤后停止。可以传 1～8，也可以传下面列出的
+            英文步骤名。None 表示运行到最后一个可用步骤。
 
-            traces_config: 可选字典，当需要从numpy数组而不是原始文件创建recording时提供
-                需严格按照以下键值对形成字典，其中traces、fs、chan_ids是必须的，
-                示例：{'traces':all_WBCs,'fs':fs,'chan_ids':channels,}
-                - traces (np.ndarray): 神经信号数据数组，形状为(n_samples, n_channels)
-                - fs (float): 采样频率(Hz)
-                - chan_ids (list): 通道ID列表
-                - metadata_folder (str): 包含recording元数据的文件夹路径(可选)
-                - properties (dict): recording属性字典(可选)
+        Returns
+        -------
+        None
 
-            n_jobs: 并行数
+        Workflow
+        --------
+        1. ``save_recording``：从 PLX 或 NumPy 数组创建并保存原始 Recording。
+        2. ``preprocess``：应用预处理 Pipeline 并保存结果。
+        3. ``sorting``：运行 sorter 并保存 Sorting。
+        4. ``create_analyzer``：创建 Analyzer、计算 extensions、导出指标表格。
+        5. ``visualize``：生成 waveform 和自相关 HTML/PNG。
+        6. ``renew_unit_type``：质量筛选并可选推断细胞类型。
+        7. ``export_to_phy``：导出 Phy 文件。
+        8. ``cell_explorer``：按配置选择是否运行 MATLAB CellExplorer。
 
-        Workflow:
-            1. 保存recording文件 (从PLX文件或numpy数组)
-            2. 预处理数据 (滤波、去噪等)
-            3. 执行spike sorting
-            4. 创建分析器并计算质量指标
-            5. 可视化排序结果
-            6. 导出到Phy格式
-            7. (可选) 运行CellExplorer进行进一步分析
-
-        Note:
-            - 当traces_config为None时，从self.input_file读取PLX文件
-            - 当traces_config提供时，从numpy数组创建recording
-            - MATLAB_AVAILABLE需要为True才能运行CellExplorer
+        Notes
+        -----
+        ``run_until_step`` 只控制“在哪里停止”，不会跳过前面的步骤。例如传入
+        4 会依次完成步骤 1～4，然后返回。CellExplorer 还需要
+        ``config["run_cell_explorer"]`` 为 True 且 MATLAB Engine 可用。
         """
-
         if config is None:
             config = {}
         if traces_config is None:
             traces_config = {}
-        # 解包配置
-        sorter_name = config.get('sorter_name', 'mountainsort5')
-        sorting_params = config.get('sorting_params', self.get_default_sorting_params(sorter_name))
-        extensions_dict = config.get('extensions_dict', self.get_default_extensions_params())
-        run_cell_explorer = config.get('run_cell_explorer', False)
 
-        # 执行管道步骤
-        print("步骤 1/6: 保存recording文件...")
+        step_names = {
+            1: "save_recording",
+            2: "preprocess",
+            3: "sorting",
+            4: "create_analyzer",
+            5: "visualize",
+            6: "renew_unit_type",
+            7: "export_to_phy",
+            8: "cell_explorer",
+        }
+        step_numbers = {name: number for number, name in step_names.items()}
+
+        requested_step = run_until_step
+        if requested_step is None:
+            requested_step = config.get("run_until_step", 8)
+        if requested_step is None:
+            requested_step = 8
+
+        if isinstance(requested_step, str):
+            normalized_step = requested_step.strip().lower()
+            if normalized_step not in step_numbers:
+                raise ValueError(
+                    "run_until_step 必须是 1～8，或以下步骤名之一："
+                    f"{list(step_numbers)}"
+                )
+            final_step = step_numbers[normalized_step]
+        elif isinstance(requested_step, int) and not isinstance(requested_step, bool):
+            if requested_step not in step_names:
+                raise ValueError("run_until_step 必须是 1～8 之间的整数")
+            final_step = requested_step
+        else:
+            raise TypeError("run_until_step 必须是 int、str 或 None")
+
+        def stop_after(step_number):
+            """完成用户指定的最后一步后打印提示并返回停止标记。"""
+            if final_step == step_number:
+                print(
+                    f"已完成步骤 {step_number}/8 "
+                    f"({step_names[step_number]})，按 run_until_step 设置停止。"
+                )
+                return True
+            return False
+
+        # 集中读取配置，使下方每个步骤只保留实际执行逻辑。
+        sorter_name = config.get("sorter_name", "mountainsort5")
+        sorting_params = config.get("sorting_params")
+        if sorting_params is None:
+            sorting_params = self._get_current_sorting_params_dict(sorter_name)
+        extensions_dict = config.get("extensions_dict")
+        preprocess_pipeline_dict = config.get("preprocess_pipeline_dict")
+        classify_units = config.get("classify_units", True)
+        max_waveforms_html = config.get("max_waveforms_html", 500)
+        max_waveforms_png = config.get("max_waveforms_png", 500)
+        run_cell_explorer = config.get("run_cell_explorer", False)
+
+        print(f"本次管道计划运行到步骤 {final_step}/8 ({step_names[final_step]})。")
+
+        print("步骤 1/8：创建并保存原始 Recording...")
         if traces_config:
-            # 从numpy数组创建并保存recording
             self.save_traces_to_recording_file(
                 traces_config.get("traces"),
                 traces_config.get("fs"),
@@ -1106,83 +1724,98 @@ class SpikeSortingPipeline:
                 n_jobs=1,
             )
         else:
-            # 从PLX文件读取并保存recording
             self.read_save_plx_file(
                 self.input_file,
                 self.output_paths.raw_recording_folder,
                 probe=probe,
                 n_jobs=n_jobs,
             )
+        if stop_after(1):
+            return
 
-        print("步骤 2/6: 预处理数据...")
-        # 执行数据预处理(滤波、whitening等)
+        print("步骤 2/8：应用预处理 Pipeline...")
         self.preprocess_recording(
             self.output_paths.raw_recording_folder,
             self.output_paths.preprocessed_recording_folder,
             n_jobs=n_jobs,
+            preprocess_pipeline_dict=preprocess_pipeline_dict,
         )
+        if stop_after(2):
+            return
 
-        print("步骤 3/6: 执行排序...")
-        # 运行spike sorting算法
+        print("步骤 3/8：执行 spike sorting...")
         self.perform_sorting(
             self.output_paths.preprocessed_recording_folder,
             sorter_name,
             self.output_paths.sorting_object_folder,
-            sorting_params
+            sorting_params,
         )
+        if stop_after(3):
+            return
 
         try:
-            print("步骤 4/6: 创建分析器...")
-            # 创建SortingAnalyzer并计算质量指标
+            print("步骤 4/8：创建 SortingAnalyzer 并计算 extensions...")
             self.create_analyzer(
                 self.output_paths.preprocessed_recording_folder,
                 self.output_paths.sorting_object_folder,
                 self.output_paths.sorting_analyzer_folder,
                 extensions_dict=extensions_dict,
-                compute=True,  # 默认立即计算扩展
-                template_metrics_path= self.output_paths.template_metrics_path,
+                compute=True,
+                template_metrics_path=self.output_paths.template_metrics_path,
                 qm_path=self.output_paths.qm_excel_path,
                 n_jobs=n_jobs,
             )
-            # 获取unit的类型、sorting质量如何和最大通道等指标
-            self.renew_unit_type(
-                self.output_paths.sorting_analyzer_folder,
-                self.output_paths.cell_type_metrics_path,
-            )
+            if stop_after(4):
+                return
 
-            print("步骤 5/6: 可视化结果...")
-            # 生成排序结果的可视化图表
+            # 可视化紧跟 Analyzer 创建；后续分类或 Phy 导出失败时，图表仍已生成。
+            print("步骤 5/8：生成 waveform 和自相关图表...")
             self.visualize_results(
                 self.output_paths.sorting_analyzer_folder,
                 fig_folder=self.output_paths.figures_folder / "waveform_figures",
+                max_waveforms_html=max_waveforms_html,
+                max_waveforms_png=max_waveforms_png,
             )
+            if stop_after(5):
+                return
 
-            print("步骤 6/6: 导出到Phy...")
-            # 导出为Phy格式用于手动curation
+            print("步骤 6/8：更新 Unit 质量和细胞类型结果...")
+            self.renew_unit_type(
+                self.output_paths.sorting_analyzer_folder,
+                self.output_paths.cell_type_metrics_path,
+                classify_units=classify_units,
+            )
+            if stop_after(6):
+                return
+
+            print("步骤 7/8：导出 Phy 文件...")
             self.export_to_phy(
                 self.output_paths.sorting_analyzer_folder,
-                self.output_paths.phy_folder
+                self.output_paths.phy_folder,
             )
+            if stop_after(7):
+                return
 
-            # 可选：运行CellExplorer进行进一步分析
-            if run_cell_explorer and self._matlab_available:
-                print("运行CellExplorer...")
-                matlab_func_path = self.matlab_func_path
-                metrics_path = self.output_paths.cell_metrics_path
+            print("步骤 8/8：检查并运行 CellExplorer...")
+            if not run_cell_explorer:
+                print("run_cell_explorer=False，跳过 CellExplorer。")
+            elif not self._matlab_available:
+                print("MATLAB Engine 不可用，跳过 CellExplorer。")
+            else:
                 self.run_cell_explorer(
                     self.output_paths.phy_folder,
-                    matlab_func_path,
-                    metrics_path
+                    self.matlab_func_path,
+                    self.output_paths.cell_metrics_path,
                 )
 
-            print("管道执行完成!")
+            print("管道执行完成！")
 
-        except ValueError as e:
-            if "need at least one array to concatenate" in str(e):
-                print(e)
-                print("存在空unit，继续执行其它文件...")
-            else:
-                raise e  # 其他 ValueError 仍然报错
+        except ValueError as exc:
+            if "need at least one array to concatenate" in str(exc):
+                print(exc)
+                print("Sorting 中存在空 Unit，已停止当前文件的后续分析。")
+                return
+            raise
 
 def print_sorter_params(sorter_name=None):
     """
@@ -1224,8 +1857,7 @@ def print_sorter_params(sorter_name=None):
 
             params = get_default_sorter_params(sorter_name)
             print(f"\n【默认参数】(共 {len(params)} 个):")
-            for key, value in params.items():
-                print(f"    {key}: {value}")
+            print(params)
 
             desc = get_sorter_params_description(sorter_name)
             print(f"\n【参数说明】:")
@@ -1242,8 +1874,7 @@ def print_sorter_params(sorter_name=None):
 
     params = get_default_sorter_params(sorter_name)
     print(f"\n【默认参数】(共 {len(params)} 个):")
-    for key, value in params.items():
-        print(f"    {key}: {value}")
+    print(params)
 
     description = get_sorter_params_description(sorter_name)
     print(f"\n【参数说明】:")

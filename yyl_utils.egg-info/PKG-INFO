@@ -1,0 +1,20 @@
+Metadata-Version: 2.1
+Name: yyl_utils
+Version: 0.1.0
+Summary: yyl 的个人工具库
+Author: Apologies-to-my-book
+Author-email: yyl1216466507@gmail.com
+Requires-Python: >=3.6
+Requires-Dist: numpy>=1.18.0
+Requires-Dist: pandas>=1.0.0
+Requires-Dist: scipy>=1.5.0
+Requires-Dist: matplotlib>=3.0.0
+Requires-Dist: seaborn>=0.10.0
+Provides-Extra: full
+Requires-Dist: spikeinterface[full]>=0.98.0; extra == "full"
+Requires-Dist: torch>=2.0.0; extra == "full"
+Provides-Extra: spike
+Requires-Dist: spikeinterface[full]>=0.98.0; extra == "spike"
+Provides-Extra: ml
+Requires-Dist: torch>=2.0.0; extra == "ml"
+Requires-Dist: scikit-learn>=1.0.0; extra == "ml"
