@@ -11,7 +11,7 @@ from .plot_utils import set_backend,set_chinese_font,plot_CI_map,get_color_with_
     LargeDataSlidePlot
 from .other_utils import check_delete_exists_path,matlab_struct_to_dict,isolate,make_sure_folder_exist,\
     add_suffix_to_filename,delete_path,SettingsWithSave,IntervalOps
-from .spikeinterface_utils import print_sorter_params,SpikeSortingPipeline,launch_phy
+from .spike_sorting_utils import SpikeSortingPipeline,launch_phy
 from .lfp_utils import RippleDetector,calc_heatmap_PAC,calc_psd,calc_band_psd_by_simpson,SOSFilter,\
     fit_log_pink_noise
 
@@ -53,7 +53,6 @@ __all__.extend([
 ])
 # .spikeinterface_utils导入
 __all__.extend([
-    'print_sorter_params',
     'SpikeSortingPipeline',
     'launch_phy',
 ])

@@ -39,50 +39,25 @@ def launch_phy(params_path, conda_env="phy2"):
     '''
     subprocess.run(['powershell', '-Command', cmd])
 
-class SpikeSortingPipeline:
-    """尖峰排序处理管道类"""
 
-    class _OutputPaths:
-        def __init__(self, base_folder: Path):
-            self.base_folder: Path = base_folder
-            self.raw_recording_folder = base_folder / 'raw_recording_folder'
-            self.preprocessed_recording_folder = base_folder / 'preprocessed_recording_folder'
-            self.sorting_verbose_folder = base_folder / 'sorting_verbose_folder'
-            self.sorting_object_folder = base_folder / 'sorting_object_folder'
-            self.sorting_analyzer_folder = base_folder / 'sorting_analyzer_folder'
-            self.phy_folder = base_folder / 'phy_folder'
-            self.figures_folder = base_folder / 'figures_folder'
-            self.qm_excel_path = base_folder / 'qm_excel.xlsx'
-            self.template_metrics_path = base_folder / 'template_metrics.xlsx'
-            self.cell_metrics_path = base_folder / "cell_metrics.joblib"
-            self.cell_type_metrics_path = base_folder / "cell_type_metrics.xlsx"
+class _PipelineOutputPaths:
+    """集中管理管道各阶段的输出路径。"""
+    def __init__(self, base_folder: Path):
+        self.base_folder: Path = base_folder
+        self.raw_recording_folder = base_folder / 'raw_recording_folder'
+        self.preprocessed_recording_folder = base_folder / 'preprocessed_recording_folder'
+        self.sorting_verbose_folder = base_folder / 'sorting_verbose_folder'
+        self.sorting_object_folder = base_folder / 'sorting_object_folder'
+        self.sorting_analyzer_folder = base_folder / 'sorting_analyzer_folder'
+        self.phy_folder = base_folder / 'phy_folder'
+        self.figures_folder = base_folder / 'figures_folder'
+        self.qm_excel_path = base_folder / 'qm_excel.xlsx'
+        self.template_metrics_path = base_folder / 'template_metrics.xlsx'
+        self.cell_metrics_path = base_folder / 'cell_metrics.joblib'
+        self.cell_type_metrics_path = base_folder / "cell_type_metrics.xlsx"
 
-    def __init__(self, input_file: str = r"", output_folder: str = r""):
-        """
-        初始化管道
-
-        Args:
-            input_file: 输入plx文件
-            output_folder: 输出结果的总目录，目录下包括recording文件夹、sorting文件夹、figure文件夹之类
-            n_jobs: 并行工作数
-        """
-
-        # 只导入必要的轻量级包
-        from pathlib import Path
-
-        self.input_file = Path(input_file)
-        self.matlab_func_path = r""
-        self.curation_model_path = r""
-        self.output_paths: SpikeSortingPipeline._OutputPaths = self._OutputPaths(Path(output_folder))
-
-        # 检查 MATLAB 是否可用（不实际导入，只做可用性检查）
-        self._matlab_available = False
-        try:
-            import matlab.engine
-            self._matlab_available = True
-        except ImportError:
-            self._matlab_available = False
-
+class _ParameterCatalogMixin:
+    """按职责组织的 ParameterCatalog 操作。重型依赖保持方法内懒加载。"""
     @staticmethod
     def get_all_sorting_params_dict(sorter_name=None, print_all_sorters=True):
         """
@@ -101,6 +76,75 @@ class SpikeSortingPipeline:
         dict
             指定 sorter 的官方默认参数；未指定或查询失败时返回空字典。
         """
+
+        def print_sorter_params(sorter_name=None):
+            """
+            获取某个sorting方法的详细参数和描述
+            :param sorter_name: sorting方法名称，若为None则打印所有可用的sorter
+            """
+            from spikeinterface.sorters import get_sorter_params_description, get_default_sorter_params, available_sorters, \
+                installed_sorters
+            import os
+
+            # 设置CMD为UTF-8模式
+            os.system('chcp 65001')
+
+            if sorter_name is None:
+                # 打印所有可用的sorter（包括未安装的）
+                available = available_sorters()
+                print("\n" + "=" * 80)
+                print(f"【所有可用的 Sorter】(共 {len(available)} 个):")
+                print("=" * 80)
+                for sorter in available:
+                    print(f"  - {sorter}")
+
+                # 打印已安装的sorter
+                installed = installed_sorters()
+                print("\n" + "=" * 80)
+                print(f"【当前环境已安装的 Sorter】(共 {len(installed)} 个):")
+                print("=" * 80)
+                for sorter in installed:
+                    print(f"  - {sorter}")
+
+                print("\n" + "=" * 80)
+                print("【各 Sorter 默认参数及参数说明】")
+                print("=" * 80)
+
+                for sorter_name in available:
+                    print(f"\n{'=' * 60}")
+                    print(f"Sorter: {sorter_name}")
+                    print('-' * 60)
+
+                    params = get_default_sorter_params(sorter_name)
+                    print(f"\n【默认参数】(共 {len(params)} 个):")
+                    print(params)
+
+                    desc = get_sorter_params_description(sorter_name)
+                    print(f"\n【参数说明】:")
+                    for key, value in desc.items():
+                        print(f"    {key}: {value}")
+
+                    print('=' * 60)
+                return
+
+            # 打印单个sorter的参数
+            print("\n" + "=" * 60)
+            print(f"Sorter: {sorter_name}")
+            print('-' * 60)
+
+            params = get_default_sorter_params(sorter_name)
+            print(f"\n【默认参数】(共 {len(params)} 个):")
+            print(params)
+
+            description = get_sorter_params_description(sorter_name)
+            print(f"\n【参数说明】:")
+            for param_name, param_desc in description.items():
+                print(f"    {param_name}: {param_desc}")
+
+            print("\n" + "=" * 60)
+
+
+        
         if print_all_sorters:
             print_sorter_params()
 
@@ -455,6 +499,9 @@ class SpikeSortingPipeline:
         probe.set_device_channel_indices(device_channel_indices)
         return probe
 
+
+class _RecordingMixin:
+    """按职责组织的 Recording 操作。重型依赖保持方法内懒加载。"""
     def save_traces_to_recording_file(self, traces, fs, chan_ids, outputpath,
                                       metadata_folder=None, properties=None,
                                       probe: Probe = None, n_jobs=1):
@@ -622,6 +669,9 @@ class SpikeSortingPipeline:
 
         return preprocessed_recording
 
+
+class _SortingMixin:
+    """按职责组织的 Sorting 操作。重型依赖保持方法内懒加载。"""
     def perform_sorting(
         self,
         input_folder,
@@ -874,6 +924,9 @@ class SpikeSortingPipeline:
                 sorting.save(folder=save_folder, overwrite=True)
         return sortings
 
+
+class _AnalyzerMixin:
+    """按职责组织的 Analyzer 操作。重型依赖保持方法内懒加载。"""
     def create_analyzer(self, recording_folder, sorting_folder, output_folder, extensions_dict=None,
                         compute=True, template_metrics_path=None, qm_path=None, n_jobs=1):
         """
@@ -988,6 +1041,9 @@ class SpikeSortingPipeline:
 
         return analyzer
 
+
+class _UnitAnalysisMixin:
+    """按职责组织的 UnitAnalysis 操作。重型依赖保持方法内懒加载。"""
     def renew_unit_type(self, analyzer_folder, cell_type_metrics_path, classify_units=True):
         """
         判断细胞的分类情况及细胞的可能类型，将结果保存至路径self.output_paths.cell_type_metrics_path
@@ -1447,6 +1503,9 @@ class SpikeSortingPipeline:
 
         return labels_noise, labels_sua_mua
 
+
+class _VisualizationMixin:
+    """按职责组织的 Visualization 操作。重型依赖保持方法内懒加载。"""
     def visualize_results(
         self,
         analyzer_folder,
@@ -2136,6 +2195,9 @@ class SpikeSortingPipeline:
                     config={"scrollZoom": True, "displaylogo": False},
                 )
 
+
+class _ExportMixin:
+    """按职责组织的 Export 操作。重型依赖保持方法内懒加载。"""
     def export_to_phy(self, analyzer_folder, output_folder):
         """
         导出到Phy格式
@@ -2285,6 +2347,9 @@ class SpikeSortingPipeline:
             print(f"MATLAB管道执行失败: {error_msg}")
             return None
 
+
+class _PipelineRunnerMixin:
+    """按职责组织的 PipelineRunner 操作。重型依赖保持方法内懒加载。"""
     def run_pipeline(
         self,
         probe: Probe = None,
@@ -2543,68 +2608,38 @@ class SpikeSortingPipeline:
                 return
             raise
 
-def print_sorter_params(sorter_name=None):
+
+class SpikeSortingPipeline(_ParameterCatalogMixin, _RecordingMixin, _SortingMixin, _AnalyzerMixin, _UnitAnalysisMixin, _VisualizationMixin, _ExportMixin, _PipelineRunnerMixin):
+    """尖峰排序处理管道类。
+
+    具体操作按职责拆分到多个内部组件类；本类保留原有公开接口，
+    通过多个组件的继承组合执行原来的完整流程。各组件中的重型
+    依赖仍在方法内部导入，不会在模块加载时提前导入。
     """
-    获取某个sorting方法的详细参数和描述
-    :param sorter_name: sorting方法名称，若为None则打印所有可用的sorter
-    """
-    from spikeinterface.sorters import get_sorter_params_description, get_default_sorter_params, available_sorters, \
-        installed_sorters
-    import os
+    _OutputPaths = _PipelineOutputPaths
 
-    # 设置CMD为UTF-8模式
-    os.system('chcp 65001')
+    def __init__(self, input_file: str = r"", output_folder: str = r""):
+        """
+        初始化管道
 
-    if sorter_name is None:
-        # 打印所有可用的sorter（包括未安装的）
-        available = available_sorters()
-        print("\n" + "=" * 80)
-        print(f"【所有可用的 Sorter】(共 {len(available)} 个):")
-        print("=" * 80)
-        for sorter in available:
-            print(f"  - {sorter}")
+        Args:
+            input_file: 输入plx文件
+            output_folder: 输出结果的总目录，目录下包括recording文件夹、sorting文件夹、figure文件夹之类
+            n_jobs: 并行工作数
+        """
 
-        # 打印已安装的sorter
-        installed = installed_sorters()
-        print("\n" + "=" * 80)
-        print(f"【当前环境已安装的 Sorter】(共 {len(installed)} 个):")
-        print("=" * 80)
-        for sorter in installed:
-            print(f"  - {sorter}")
+        # 只导入必要的轻量级包
+        from pathlib import Path
 
-        print("\n" + "=" * 80)
-        print("【各 Sorter 默认参数及参数说明】")
-        print("=" * 80)
+        self.input_file = Path(input_file)
+        self.matlab_func_path = r""
+        self.curation_model_path = r""
+        self.output_paths: SpikeSortingPipeline._OutputPaths = self._OutputPaths(Path(output_folder))
 
-        for sorter_name in available:
-            print(f"\n{'=' * 60}")
-            print(f"Sorter: {sorter_name}")
-            print('-' * 60)
-
-            params = get_default_sorter_params(sorter_name)
-            print(f"\n【默认参数】(共 {len(params)} 个):")
-            print(params)
-
-            desc = get_sorter_params_description(sorter_name)
-            print(f"\n【参数说明】:")
-            for key, value in desc.items():
-                print(f"    {key}: {value}")
-
-            print('=' * 60)
-        return
-
-    # 打印单个sorter的参数
-    print("\n" + "=" * 60)
-    print(f"Sorter: {sorter_name}")
-    print('-' * 60)
-
-    params = get_default_sorter_params(sorter_name)
-    print(f"\n【默认参数】(共 {len(params)} 个):")
-    print(params)
-
-    description = get_sorter_params_description(sorter_name)
-    print(f"\n【参数说明】:")
-    for param_name, param_desc in description.items():
-        print(f"    {param_name}: {param_desc}")
-
-    print("\n" + "=" * 60)
+        # 检查 MATLAB 是否可用（不实际导入，只做可用性检查）
+        self._matlab_available = False
+        try:
+            import matlab.engine
+            self._matlab_available = True
+        except ImportError:
+            self._matlab_available = False
