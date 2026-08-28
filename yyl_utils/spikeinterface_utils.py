@@ -218,8 +218,9 @@ class SpikeSortingPipeline:
             name: si.get_default_analyzer_extension_params(name)
             for name in extension_names
         }
-        extension_params["random_spikes"]["max_spikes_per_unit"] = 500
+        extension_params["random_spikes"]["max_spikes_per_unit"] = 2000
         extension_params["templates"]["operators"] = ["average", "std", "median"]
+        extension_params["correlograms"]["bin_ms"] = 0.5
         return extension_params
 
     @staticmethod
@@ -331,19 +332,19 @@ class SpikeSortingPipeline:
             原代码使用无参数的通用 ``filter()``。在 SpikeInterface 0.104.8 中，
             通用 filter 要求显式提供 margin_ms，否则会报错。因此这里使用参数等价、
             边缘长度可自动计算的 ``bandpass_filter``，滤波范围仍为 300～6000 Hz。
+            注意blank_saturation的硬阈值单位和传入的recording单位相同(目前统一是uV)。
         """
         return {
             "bandpass_filter": {
                 "freq_min": 300.0,
                 "freq_max": 6000.0,
-                "margin_ms": "auto",
             },
             "center": {
                 "mode": "median",
                 "dtype": "float32",
             },
             "blank_saturation": {
-                "abs_threshold": 0.5,
+                "abs_threshold": 500,
                 "direction": "both",
             },
             "common_reference": {
@@ -461,7 +462,8 @@ class SpikeSortingPipeline:
         保存记录数据到二进制文件
 
         Args:
-            traces: 神经信号数据，形状为 [时间点, 通道数] 的numpy数组
+            traces: 神经信号数据，形状为 [时间点, 通道数] 的numpy数组，
+                注意默认传入的单位是uV，注意这个单位会影响后面的阈值去噪和画波形。
             fs: 采样频率 (Hz)
             chan_ids: 通道ID列表
             outputpath: 输出文件路径
@@ -503,8 +505,8 @@ class SpikeSortingPipeline:
 
         # 保存重建的recording到二进制文件
         yyl.check_delete_exists_path(outputpath)  # 检查并删除已存在的路径
+        rec_fixed.set_property(key="group",values=[shank.shank_id for shank in probe.get_shanks()])
         rec_fixed.save(folder=outputpath, format="binary", name='plx测试', verbose=True, n_jobs=n_jobs)
-
         return rec_fixed
 
     def read_save_plx_file(self, inputpath, outputpath, probe: Probe = None, n_jobs=1):
@@ -522,7 +524,9 @@ class SpikeSortingPipeline:
         # 提取原始数据
         test_recording = se.read_plexon(inputpath, stream_id='WBC')  # 读plx文件
         # 用同样的通道属性重建recording(plx直接保存会报错)
-        traces = test_recording.get_traces()  # 得到plx文件的原始数据(未缩放,缩放会导致cellexplorer读取失败)
+        # 得到plx文件的原始数据,已return_in_uV,注意return_in_uV会导致cellexplorer读取失败，
+        # 失败原因是cellexplorer内置有一个LSB，你缩放后的数据它还会再缩放一次导致数值过大读取失败。
+        traces = test_recording.get_traces(return_in_uV=True)
         fs = test_recording.get_sampling_frequency()  # 得到plx文件的采样率
         chan_ids = test_recording.channel_ids  # 得到plx文件的通道id
 
@@ -550,6 +554,7 @@ class SpikeSortingPipeline:
 
         # 保存重建的recording
         yyl.check_delete_exists_path(outputpath)
+        rec_fixed.set_property(key="group",values=[shank.shank_id for shank in probe.get_shanks()])
         rec_fixed.save(folder=outputpath, format="binary", name='plx测试', verbose=True, n_jobs=n_jobs)
         return rec_fixed
 
@@ -617,7 +622,15 @@ class SpikeSortingPipeline:
 
         return preprocessed_recording
 
-    def perform_sorting(self, input_folder, sorter_name, output_folder, params=None):
+    def perform_sorting(
+        self,
+        input_folder,
+        sorter_name,
+        output_folder,
+        params=None,
+        run_in_docker=None,
+        group_n_jobs=1,
+    ):
         """
         按 Probe 的 shank 分组独立执行 sorting，再合并各组结果。
 
@@ -631,6 +644,9 @@ class SpikeSortingPipeline:
             合并后 Sorting 的保存文件夹。
         params : dict | None, default: None
             sorter 参数；None 使用 _get_current_sorting_params_dict()。
+        group_n_jobs : int, default: 1
+            同时运行的 group sorter 数量。Kilosort4 通常使用 GPU，默认串行运行
+            以避免多个任务争抢显存；确认显存充足时可设置为大于 1。
 
         Returns
         -------
@@ -640,14 +656,18 @@ class SpikeSortingPipeline:
         Notes
         -----
         Recording.set_probe() 会根据 Probe.shank_ids 生成 ``group`` 属性。
-        run_sorter_by_property() 先按该属性硬拆分 Recording，因此 sorter 内部的
-        whitening、检测和聚类均不会跨 shank。
+        函数会先按该属性拆分 Recording，再为每个 group 创建独立的 sorter
+        工作目录。group sorter 可并行运行；某个 group 失败或没有 Unit 时只跳过
+        该 group，不会阻止其它 group 完成。最后只合并成功 group 的结果。
         """
         import spikeinterface as si
         import spikeinterface.sorters as ss
         import yyl_utils as yyl
+        import numpy as np
         from pathlib import Path
         from tempfile import TemporaryDirectory
+        from joblib import Parallel, delayed
+        import traceback
 
         recording = si.load(input_folder)
 
@@ -655,6 +675,14 @@ class SpikeSortingPipeline:
             params = self._get_current_sorting_params_dict(sorter_name)
         else:
             params = params.copy()
+
+        if not isinstance(group_n_jobs, int) or isinstance(group_n_jobs, bool):
+            raise TypeError("group_n_jobs 必须是整数")
+        if group_n_jobs == -1:
+            import os
+            group_n_jobs = os.cpu_count() or 1
+        if group_n_jobs <= 0:
+            raise ValueError("group_n_jobs 必须是正整数或 -1")
 
         if "group" not in recording.get_property_keys():
             raise ValueError(
@@ -669,29 +697,113 @@ class SpikeSortingPipeline:
         group_values = recording.get_property("group")
         print(f"按 {len(set(group_values.tolist()))} 个 shank 分组独立运行 {sorter_name}")
 
+        recording_dict = recording.split_by("group")
+
         # sorter 的中间结果放入临时目录；最终 Sorting 保存完成后自动清理。
         with TemporaryDirectory(
             prefix=f"{output_folder.name}_shank_sorting_",
             dir=output_folder.parent,
+            ignore_cleanup_errors=True,
         ) as sorter_working_folder:
-            sorting = ss.run_sorter_by_property(
-                sorter_name=sorter_name,
-                recording=recording,
-                grouping_property="group",
-                folder=sorter_working_folder,
-                engine="loop",
-                verbose=True,
-                **params,
+            def run_one_group(group_name, group_recording):
+                """运行一个 group；异常返回给主线程，不中断其它 group。"""
+                group_folder = Path(sorter_working_folder) / str(group_name)
+                try:
+                    print(f"开始处理 group={group_name}")
+                    group_sorting = ss.run_sorter(
+                        sorter_name=sorter_name,
+                        recording=group_recording,
+                        folder=str(group_folder),
+                        verbose=False,
+                        docker_image=run_in_docker,
+                        **params,
+                    )
+                    if group_sorting is None or len(group_sorting.unit_ids) == 0:
+                        return group_name, None, "没有检测到有效 Unit"
+                    return group_name, group_sorting, None
+                except Exception as exc:
+                    return group_name, None, (
+                        f"{exc}\n{traceback.format_exc()}"
+                    )
+
+            effective_n_jobs = min(group_n_jobs, max(1, len(recording_dict)))
+            # joblib 使用独立进程执行 group sorter。每个任务都有独立输出目录，
+            # 单个任务的异常会由 run_one_group 转换成返回值，不会中断其它任务。
+            parallel_results = Parallel(
+                n_jobs=effective_n_jobs,
+                backend="loky",
+            )(
+                delayed(run_one_group)(group_name, group_recording)
+                for group_name, group_recording in recording_dict.items()
             )
 
-            # 给所有 Unit 统一添加前缀，避免不同 shank 的 Unit ID 冲突。
+            group_results = {}
+            for group_name, group_sorting, error_message in parallel_results:
+                if group_sorting is None:
+                    print(f"group={group_name} 已跳过：{error_message}")
+                else:
+                    print(
+                        f"group={group_name} 完成，Unit 数量："
+                        f"{len(group_sorting.unit_ids)}"
+                    )
+                group_results[group_name] = group_sorting
+
+            sorting_list = [
+                group_results[group_name]
+                for group_name in recording_dict
+                if group_results.get(group_name) is not None
+            ]
+            successful_groups = [
+                group_name
+                for group_name in recording_dict
+                if group_results.get(group_name) is not None
+            ]
+
+            if not sorting_list:
+                print("所有 group 都没有产生有效 Unit，当前 sorting 结果为空。")
+                empty_sorting = si.NumpySorting.from_unit_dict(
+                    {}, recording.sampling_frequency
+                )
+                empty_sorting.save(folder=output_folder, overwrite=True)
+                return empty_sorting
+
+            # 合并成功 group 的 sorting，并恢复每个 Unit 所属的 group 属性。
+            sorting = si.aggregate_units(sorting_list)
+            unit_groups = []
+            for group_name, group_sorting in zip(successful_groups, sorting_list):
+                unit_groups.extend([group_name] * len(group_sorting.unit_ids))
+            sorting.set_property("group", np.asarray(unit_groups))
+            sorting.register_recording(recording)
+
+            # run_sorter_by_property() 会把每个 Unit 所属的 group 保存为
+            # Sorting 的 group property。先读取该 property，再在每个 group 内
+            # 从 1 开始编号，避免所有 shank 共用 raw_unit_1、raw_unit_2 这种编号。
             if len(sorting.unit_ids) > 0:
-                new_ids = [f"raw_unit_{i}" for i in range(1, len(sorting.unit_ids) + 1)]
+                unit_groups = sorting.get_property("group")
+                if unit_groups is None:
+                    raise ValueError(
+                        "sorting 结果缺少 'group' 属性，无法按 group 重命名 Unit。"
+                    )
+                if len(unit_groups) != len(sorting.unit_ids):
+                    raise ValueError(
+                        "sorting 的 'group' 属性长度与 unit_ids 数量不一致，"
+                        "无法安全重命名 Unit。"
+                    )
+
+                group_counts = {}
+                new_ids = []
+                for group in unit_groups:
+                    group_name = str(group)
+                    group_counts[group_name] = group_counts.get(group_name, 0) + 1
+                    # 例如 group=0 时生成 0_unit_1、0_unit_2；
+                    # group=shankA 时生成 shankA_unit_1、shankA_unit_2。
+                    new_ids.append(f"group_{group_name}_unit_{group_counts[group_name]}")
+
                 sorting = sorting.rename_units(new_ids)
-            sorting = sorting.save(folder=output_folder,overwrite=True,)
+            sorting = sorting.save(folder=output_folder, overwrite=True)
             return sorting
 
-    def batch_sorting(self, input_folder_list: list[str], output_base_folder, sorter_name, params=None, n_jobs=1):
+    def batch_sorting(self, input_folder_list: list[str], output_base_folder, sorter_name, params=None, run_in_docker=None, n_jobs=1):
         """
         批量排序
         注意保存的verbose_path路径不能在同一个子文件夹下，必须是不同的倒数第二级文件夹，不然它们的元文件会串起来进而报错
@@ -729,7 +841,7 @@ class SpikeSortingPipeline:
                 'verbose': True,
                 'remove_existing_folder': False,
                 'raise_error': False,
-                'docker_image': False,
+                'docker_image': run_in_docker,
                 'delete_container_files': False,
                 # 'installation_mode': "folder",
                 # 'spikeinterface_folder_source':  # spikeinterface安装包路径
@@ -842,7 +954,7 @@ class SpikeSortingPipeline:
                         peak_sign="both",
                         mode="peak_to_peak",
                         outputs="id",
-                        operator="median",
+                        # operator="median",
                     )
                 except (KeyError, ValueError) as exc:
                     raise ValueError(
@@ -885,22 +997,51 @@ class SpikeSortingPipeline:
         # 延迟导入 spikeinterface
         import spikeinterface as si
         import pandas as pd
+        import numpy as np
 
-        def screen_units(df_qm_metrics):
+        def screen_units(df_qm_metrics, unit_ids=None):
             """
             根据质量指标筛选符合分析条件的神经元单元
             """
             # 读取质量指标和模板指标数据
             # 初始化筛选字典：包含所有unit_id和空的质量列表
-            screen_dict = {"unit_ids": df_qm_metrics.index.tolist(),
+            # 以 Analyzer 的完整 Unit 列表为准。quality_metrics 缺失某些 Unit
+            # 时，也要在输出表中保留这些 Unit，并将对应指标留空。
+            if unit_ids is None:
+                unit_ids = df_qm_metrics.index.tolist()
+            else:
+                unit_ids = list(unit_ids)
+            screen_dict = {"unit_ids": unit_ids,
                            "sorting_quality": []}
 
-            # 筛选符合条件的unit进行分析
+            # Allen Visual Coding Neuropixels 论文展示 unit 数量时使用：
+            # `isi_violations < 0.5`、`amplitude_cutoff < 0.1`、`presence_ratio > 0.95`，
+            # 这是一个较为认可的默认标准，参考文献doi：10.1038/s41586-020-03171-x。
+            isi_column = (
+                "isi_violations"
+                if "isi_violations" in df_qm_metrics.columns
+                else "isi_violations_ratio"
+            )
             for unit_id in screen_dict["unit_ids"]:
-                # 筛选条件：ISI违例率<0.5 且 放电率>0.5Hz 且 放电率<50Hz
-                if ((df_qm_metrics.loc[unit_id, 'isi_violations_ratio'] < 0.5) &
-                        (df_qm_metrics.loc[unit_id, 'firing_rate'] > 0.5) &
-                        (df_qm_metrics.loc[unit_id, 'firing_rate'] < 50)
+                # 按 ISI 违例率、振幅截断率和存在率判定排序质量。
+                required_columns = (
+                    isi_column,
+                    "amplitude_cutoff",
+                    "presence_ratio",
+                )
+                values_available = all(
+                    unit_id in df_qm_metrics.index
+                    and column in df_qm_metrics.columns
+                    and pd.notna(df_qm_metrics.loc[unit_id, column])
+                    for column in required_columns
+                )
+                if not values_available:
+                    # 找不到某个质量指标时不臆测好坏，Excel 中留空。
+                    screen_dict["sorting_quality"].append("")
+                elif (
+                    (df_qm_metrics.loc[unit_id, isi_column] < 0.5)
+                    and (df_qm_metrics.loc[unit_id, "amplitude_cutoff"] < 0.1)
+                    and (df_qm_metrics.loc[unit_id, "presence_ratio"] > 0.95)
                 ):
                     # 符合所有筛选条件的单元标记为"good"
                     screen_dict["sorting_quality"].append("good")
@@ -908,63 +1049,311 @@ class SpikeSortingPipeline:
                     screen_dict["sorting_quality"].append("bad")
             return screen_dict
 
-        def get_units_classified(df_qm_metrics, df_template_metrics):
-            """
-            根据波形特征和放电率对神经元进行分类
-            分类标准（基于文献报道的锥体神经元和中间神经元特征）：
-            -  putative_pyramidal_units（ putative锥体神经元）:
-                * peak_to_valley > 0.4 ms（宽波形）
-                * 放电率 < 5 Hz（低频放电）
+        def _fit_acg_tau_rise_from_correlograms(analyzer, unit_ids):
+            """按照 CellExplorer 的三指数模型，从 correlograms 拟合 tau rise。
 
-            -  putative_interneuron_units（ putative中间神经元）:
-                * peak_to_valley < 0.4 ms（窄波形）
-                * 放电率 > 10 Hz（高频放电）
+            CellExplorer 的 ``fit_ACG.m`` 使用正半轴 ACG（0.5--50 ms，0.5 ms
+            bin），并拟合
+            ``max(c*(exp(-(x-f)/a)-d*exp(-(x-f)/b)) +
+            h*exp(-(x-f)/g) + e, 0)``。
+            SpikeInterface 返回的是 bin edges 和 ``(unit, unit, bin)`` 计数，
+            因此这里取零点右侧的 bin，第一格置零以去除自相关零点峰。
             """
-            # 检查两个表格的unit_id是否完全一致
-            if not df_template_metrics.index.tolist() == df_qm_metrics.index.tolist():
-                raise ValueError("两表格的unit_ids不匹配")
+            import numpy as np
+            import pandas as pd
 
-            # 初始化分类字典：包含所有unit_id和空的细胞类型列表
-            classify_dict = {"unit_ids": df_template_metrics.index.tolist(),
+            extension_name = None
+            for candidate in ("correlograms", "auto_correlograms"):
+                if analyzer.has_extension(candidate):
+                    extension_name = candidate
+                    break
+            if extension_name is None:
+                return pd.Series(np.nan, index=unit_ids, dtype="float64")
+
+            try:
+                ccgs, bins = analyzer.get_extension(extension_name).get_data()
+                ccgs = np.asarray(ccgs)
+                bins = np.asarray(bins, dtype=float)
+                if ccgs.ndim != 3 or bins.ndim != 1 or ccgs.shape[-1] != bins.size - 1:
+                    raise ValueError("correlograms 的数组形状与 bins 不匹配")
+            except Exception as exc:
+                print(f"无法读取或拟合 correlograms，acg_tau_rise 留空：{exc}")
+                return pd.Series(np.nan, index=unit_ids, dtype="float64")
+
+            # 与 CellExplorer 的初值、下界和上界保持一致，参数单位均为 ms。
+            initial = np.array([20.0, 1.0, 30.0, 2.0, 0.5, 5.0, 1.5, 2.0])
+            lower = np.array([1.0, 0.1, 0.0, 0.0, -30.0, 0.0, 0.1, 0.0])
+            upper = np.array([500.0, 50.0, 500.0, 15.0, 50.0, 20.0, 5.0, 100.0])
+
+            def triple_exponential(x, a, b, c, d, e, f, g, h):
+                value = c * (np.exp(-(x - f) / a) - d * np.exp(-(x - f) / b))
+                value += h * np.exp(-(x - f) / g) + e
+                return np.maximum(value, 0.0)
+
+            try:
+                from scipy.optimize import differential_evolution, least_squares
+            except Exception as exc:
+                print(f"SciPy 优化器不可用，acg_tau_rise 留空：{exc}")
+                return pd.Series(np.nan, index=unit_ids, dtype="float64")
+
+            def fit_one_acg(x, y, seed):
+                """先用差分进化找全局初值，再用 least_squares 精细拟合。"""
+                def residual(parameters):
+                    return triple_exponential(x, *parameters) - y
+
+                def objective(parameters):
+                    residual_values = residual(parameters)
+                    return float(np.sum(residual_values * residual_values))
+
+                # 差分进化降低单一起始点陷入局部最优的概率；关闭内部 polish，
+                # 由后面的 least_squares 统一完成局部精修。
+                de_result = differential_evolution(
+                    objective,
+                    bounds=list(zip(lower, upper)),
+                    seed=seed,
+                    maxiter=40,
+                    popsize=6,
+                    tol=0.02,
+                    polish=False,
+                    workers=1,
+                    updating="immediate",
+                )
+                local_result = least_squares(
+                    residual,
+                    x0=np.clip(de_result.x, lower, upper),
+                    bounds=(lower, upper),
+                    method="trf",
+                    loss="linear",
+                    x_scale="jac",
+                    max_nfev=5000,
+                )
+                if not local_result.success or not np.all(np.isfinite(local_result.x)):
+                    return None
+                return local_result.x
+
+            bin_width = float(np.median(np.diff(bins)))
+            bin_centers = (bins[:-1] + bins[1:]) / 2.0
+            positive_indices = np.flatnonzero(bin_centers >= 0.0)
+            tau_rise = pd.Series(np.nan, index=unit_ids, dtype="float64")
+
+            for unit_position, unit_id in enumerate(unit_ids):
+                try:
+                    if unit_position >= ccgs.shape[0]:
+                        continue
+                    # 只使用零点右侧，x 从一个 bin 宽度开始，和 fit_ACG.m 的
+                    # x = 0.5:0.5:50 写法一致；第一格对应被清零的中心 bin。
+                    y = np.asarray(ccgs[unit_position, unit_position, positive_indices], dtype=float)
+                    if y.size < 8:
+                        continue
+                    y = y.copy()
+                    y[0] = 0.0
+                    x = np.arange(1, y.size + 1, dtype=float) * bin_width
+                    valid = np.isfinite(x) & np.isfinite(y)
+                    if valid.sum() < 8 or np.nanmax(y[valid]) <= 0:
+                        continue
+                    fitted = fit_one_acg(x[valid], y[valid], seed=unit_position)
+                    if fitted is not None and np.isfinite(fitted[1]):
+                        tau_rise.loc[unit_id] = float(fitted[1])
+                except Exception:
+                    # 单个 Unit 的 ACG 质量不足或拟合不收敛时，不影响其它 Unit。
+                    continue
+            return tau_rise
+
+        def _get_acg_tau_rise(analyzer, unit_ids, df_qm_metrics):
+            """读取已有 acg_tau_rise；没有时从 correlograms 自动拟合。"""
+            # 某些外部/CellExplorer 结果会直接合并到 quality_metrics 表中。
+            if "acg_tau_rise" in df_qm_metrics.columns:
+                return df_qm_metrics["acg_tau_rise"].reindex(unit_ids)
+
+            # SpikeInterface 0.104.8 的默认扩展没有名为 acg_tau_rise 的标准扩展，
+            # 因此兼容任意已保存扩展，只要其 get_data() 返回该列/字段即可。
+            extension_names = set(analyzer.get_loaded_extension_names())
+            if analyzer.format != "memory":
+                extension_names.update(analyzer.get_saved_extension_names())
+
+            for extension_name in extension_names:
+                extension = analyzer.get_extension(extension_name)
+                if extension is None:
+                    continue
+                try:
+                    data = extension.get_data()
+                except Exception:
+                    continue
+
+                if isinstance(data, pd.DataFrame) and "acg_tau_rise" in data.columns:
+                    return data["acg_tau_rise"].reindex(unit_ids)
+                if isinstance(data, dict) and "acg_tau_rise" in data:
+                    values = data["acg_tau_rise"]
+                    if isinstance(values, dict):
+                        return pd.Series(values, dtype="float64").reindex(unit_ids)
+                    return pd.Series(values, index=unit_ids, dtype="float64")
+
+            fitted_tau_rise = _fit_acg_tau_rise_from_correlograms(analyzer, unit_ids)
+            if fitted_tau_rise.notna().any():
+                print("已根据 correlograms 的 ACG 直方图拟合 acg_tau_rise。")
+            else:
+                print("未找到或无法拟合 acg_tau_rise，相关 putative_cell_type 结果留空。")
+            return fitted_tau_rise
+
+        def get_units_classified(
+            df_qm_metrics,
+            df_template_metrics,
+            analyzer,
+            acg_tau_rise=None,
+            unit_ids=None,
+        ):
+            """
+            根据 CellExplorer 的启发式规则进行推定细胞类型分类：
+            - troughToPeak <= 0.425 ms：Narrow Interneuron；
+            - troughToPeak > 0.425 ms 且 acg_tau_rise > 6 ms：Wide Interneuron；
+            - troughToPeak > 0.425 ms 且 acg_tau_rise <= 6 ms：Pyramidal Cell。
+
+            ``troughToPeak`` 在 SpikeInterface 模板指标中对应
+            ``peak_to_trough_duration``（旧版本为 ``peak_to_valley``），单位为秒；
+            ``acg_tau_rise`` 从 Analyzer 扩展或质量指标表中读取，单位为毫秒。
+            """
+            # 以 Analyzer 的 Unit 列表为准；某个扩展缺失 Unit 时，该 Unit 的
+            # 分类结果留空，而不是让整个 renew_unit_type 失败。
+            classify_unit_ids = list(
+                sorting_analyzer.unit_ids
+                if unit_ids is None
+                else unit_ids
+            )
+            classify_dict = {"unit_ids": classify_unit_ids,
                              "putative_cell_type": []}
 
-            # 判断神经元的兴奋/抑制类型
+            # 读取 ACG 拟合得到的 tau rise；该值不是 correlograms 直方图本身，
+            # 必须来自额外的 ACG 拟合结果。调用方已经计算过时直接复用，
+            # 避免为了“输出指标”和“细胞分类”重复拟合。
+            if acg_tau_rise is None:
+                acg_tau_rise = _get_acg_tau_rise(
+                    analyzer,
+                    classify_unit_ids,
+                    df_qm_metrics,
+                )
+
+            # 判断神经元的推定类型
             if classify_dict["unit_ids"]:
                 for unit_id in classify_dict["unit_ids"]:
                     # 新版 SpikeInterface 使用 peak_to_trough_duration；兼容旧表格的
                     # peak_to_valley 列，二者含义都是波峰到波谷的时间间隔（秒）。
-                    duration_column = (
-                        "peak_to_trough_duration"
-                        if "peak_to_trough_duration" in df_template_metrics.columns
-                        else "peak_to_valley"
-                    )
-                    peak_to_valley_ms = df_template_metrics.loc[unit_id, duration_column] * 1000
-                    firing_rate = df_qm_metrics.loc[unit_id, 'firing_rate']
-
-                    # 锥体神经元：宽波形 + 低频放电
-                    if (peak_to_valley_ms > 0.4) and (firing_rate < 5):
-                        classify_dict["putative_cell_type"].append("putative_pyramidal_units")
-
-                    # 中间神经元：窄波形 + 高频放电
-                    elif (peak_to_valley_ms < 0.4) and (firing_rate > 10):
-                        classify_dict["putative_cell_type"].append("putative_interneuron_units")
+                    if unit_id not in df_template_metrics.index:
+                        classify_dict["putative_cell_type"].append("")
+                        continue
+                    if "peak_to_trough_duration" in df_template_metrics.columns:
+                        duration_column = "peak_to_trough_duration"
+                    elif "peak_to_valley" in df_template_metrics.columns:
+                        duration_column = "peak_to_valley"
                     else:
-                        # 不满足任一条件的单元，标记为未分类
-                        classify_dict["putative_cell_type"].append("unclassified_units")
+                        classify_dict["putative_cell_type"].append("")
+                        continue
+                    trough_to_peak_ms = (
+                        df_template_metrics.loc[unit_id, duration_column] * 1000
+                    )
+                    tau_rise_ms = acg_tau_rise.loc[unit_id]
+
+                    try:
+                        valid_metrics = np.isfinite(float(trough_to_peak_ms)) and np.isfinite(
+                            float(tau_rise_ms)
+                        )
+                    except (TypeError, ValueError):
+                        valid_metrics = False
+
+                    if not valid_metrics:
+                        # 找不到必要指标时不强行归类，Excel 中留空。
+                        classify_dict["putative_cell_type"].append("")
+                    elif trough_to_peak_ms <= 0.425:
+                        classify_dict["putative_cell_type"].append(
+                            "putative_narrow_interneuron_units"
+                        )
+                    elif tau_rise_ms > 6:
+                        classify_dict["putative_cell_type"].append(
+                            "putative_wide_interneuron_units"
+                        )
+                    else:
+                        classify_dict["putative_cell_type"].append(
+                            "putative_pyramidal_units"
+                        )
             return classify_dict
 
         sorting_analyzer = si.load(analyzer_folder)
         # 读取质量指标Excel文件
-        df_qm_metrics = sorting_analyzer.extensions["quality_metrics"].get_data()
-        # 执行单元筛选，获取质量标记
-        renew_dict = screen_units(df_qm_metrics)
+        if sorting_analyzer.has_extension("quality_metrics"):
+            df_qm_metrics = sorting_analyzer.get_extension("quality_metrics").get_data()
+        else:
+            print("Analyzer 缺少 quality_metrics，sorting_quality 结果留空。")
+            df_qm_metrics = pd.DataFrame(index=sorting_analyzer.unit_ids)
+        unit_ids = list(sorting_analyzer.unit_ids)
+        # 执行单元筛选，获取质量标记；即使质量扩展不完整，也保留所有 Unit。
+        renew_dict = screen_units(df_qm_metrics, unit_ids=unit_ids)
+
+        # 将质量判断所依据的原始指标一并写入 Excel，便于回溯每个 Unit
+        # 为什么被标记为 good/bad。找不到的值统一留空（NaN）。
+        isi_column = (
+            "isi_violations"
+            if "isi_violations" in df_qm_metrics.columns
+            else "isi_violations_ratio"
+            if "isi_violations_ratio" in df_qm_metrics.columns
+            else "isi_violations"
+        )
+        renew_dict[isi_column] = [
+            df_qm_metrics.loc[unit_id, isi_column]
+            if unit_id in df_qm_metrics.index and isi_column in df_qm_metrics.columns
+            else np.nan
+            for unit_id in unit_ids
+        ]
+        for metric_name in ("amplitude_cutoff", "presence_ratio"):
+            renew_dict[metric_name] = [
+                df_qm_metrics.loc[unit_id, metric_name]
+                if unit_id in df_qm_metrics.index and metric_name in df_qm_metrics.columns
+                else np.nan
+                for unit_id in unit_ids
+            ]
+
+        # ACG 拟合指标独立于细胞类型分类输出。这样即使调用者把
+        # classify_units 设为 False，Excel 中仍会保留每个 Unit 的 acg_tau_rise。
+        acg_tau_rise = _get_acg_tau_rise(
+            sorting_analyzer,
+            unit_ids,
+            df_qm_metrics,
+        )
+        renew_dict["acg_tau_rise"] = [
+            acg_tau_rise.get(unit_id, np.nan) for unit_id in unit_ids
+        ]
+
+        # 输出细胞类型判断使用的 trough-to-peak（毫秒）。SpikeInterface
+        # 通常以秒保存该指标，因此写入 Excel 前统一换算为 ms。
+        if sorting_analyzer.has_extension("template_metrics"):
+            df_template_metrics = sorting_analyzer.get_extension("template_metrics").get_data()
+        else:
+            print("Analyzer 缺少 template_metrics，troughToPeak 和 putative_cell_type 结果留空。")
+            df_template_metrics = pd.DataFrame(index=unit_ids)
+        duration_column = (
+            "peak_to_trough_duration"
+            if "peak_to_trough_duration" in df_template_metrics.columns
+            else "peak_to_valley"
+            if "peak_to_valley" in df_template_metrics.columns
+            else None
+        )
+        renew_dict["troughToPeak"] = [
+            df_template_metrics.loc[unit_id, duration_column] * 1000
+            if duration_column is not None
+            and unit_id in df_template_metrics.index
+            and pd.notna(df_template_metrics.loc[unit_id, duration_column])
+            else np.nan
+            for unit_id in unit_ids
+        ]
 
         # 如果需要分类神经元类型
         if classify_units:
-            # 读取模板指标Excel文件
-            df_template_metrics = sorting_analyzer.extensions["template_metrics"].get_data()
             # 执行细胞类型分类
-            classify_dict = get_units_classified(df_qm_metrics, df_template_metrics)
+            classify_dict = get_units_classified(
+                df_qm_metrics,
+                df_template_metrics,
+                sorting_analyzer,
+                acg_tau_rise=acg_tau_rise,
+                unit_ids=unit_ids,
+            )
             # 合并筛选字典和分类字典
             renew_dict = {**renew_dict, **classify_dict}
 
@@ -1062,15 +1451,18 @@ class SpikeSortingPipeline:
         self,
         analyzer_folder,
         fig_folder=None,
-        max_waveforms_html=500,
-        max_waveforms_png=500,
+        max_waveforms_html=2000,
+        max_waveforms_png=2000,
+        plot_group_waveforms=True,
+        max_waveforms_group=2000,
     ):
         """
-        为每个 Unit 生成 waveform、自相关及二者合并图。
+        为每个 Unit 生成 waveform、自相关及二者合并图，并可按 group 汇总波形。
 
         波形图只展示峰峰值最大的通道。横轴是相对 spike 对齐点的时间，单位为
         毫秒；纵轴是绝对电压，单位为微伏。PNG 中 waveform 子图的纵轴固定为
-        -200 到 200 μV；HTML 保留自动缩放。每个 Unit 只保留两个 HTML 和一个 PNG。
+        -200 到 200 μV；HTML 保留自动缩放。每个 Unit 只保留两个 HTML 和一个 PNG；
+        另外可按 group 生成汇总 waveform HTML。
 
         Parameters
         ----------
@@ -1078,11 +1470,15 @@ class SpikeSortingPipeline:
             已计算 ``waveforms`` 和 ``correlograms`` 扩展的 Analyzer 文件夹。
         fig_folder : str | Path | None, default: None
             图表输出目录；None 表示只打印 Unit 数量，不生成文件。
-        max_waveforms_html : int, default: 500
-            waveform HTML 最多展示的单次波形数。Plotly 会把这些波形合并成一个
-            WebGL 数据对象；如果显卡性能有限，仍可将该值调小。
-        max_waveforms_png : int, default: 500
+        max_waveforms_html : int, default: 2000
+            每个 Unit 在普通 waveform HTML 中最多展示的单次波形数。Plotly 会把
+            这些波形合并成一个 WebGL 数据对象；如果显卡性能有限，仍可将该值调小。
+        max_waveforms_png : int, default: 2000
             合并 PNG 最多展示的单次波形数。
+        plot_group_waveforms : bool, default: True
+            是否将同一 group 内各 Unit 的峰值通道单次波形绘制到同一个 Plotly HTML 图中。
+        max_waveforms_group : int, default: 2000
+            每个 Unit 在 group waveform HTML 和 group PCA HTML 中最多使用的波形数。
 
         Returns
         -------
@@ -1092,7 +1488,7 @@ class SpikeSortingPipeline:
         -----
         中位波形始终使用 Analyzer 中该 Unit 的全部 waveforms 计算，不受展示数量限制。
         HTML 使用 Plotly WebGL，并把多条 waveform 合并为一个 trace，避免 mpld3
-        为 500 条曲线创建大量 SVG 对象。PNG 是静态图片，最多保留 500 条。
+        为 2000 条曲线创建大量 SVG 对象。PNG 是静态图片，最多保留 2000 条。
         """
         import numpy as np
         import matplotlib.pyplot as plt
@@ -1104,6 +1500,8 @@ class SpikeSortingPipeline:
             raise ValueError("max_waveforms_html 必须是大于 0 的整数")
         if not isinstance(max_waveforms_png, int) or max_waveforms_png <= 0:
             raise ValueError("max_waveforms_png 必须是大于 0 的整数")
+        if not isinstance(max_waveforms_group, int) or max_waveforms_group <= 0:
+            raise ValueError("max_waveforms_group 必须是大于 0 的整数")
 
         analyzer = si.load(analyzer_folder)
         unit_counts = analyzer.sorting.count_num_spikes_per_unit()
@@ -1113,23 +1511,61 @@ class SpikeSortingPipeline:
         if fig_folder is None or len(analyzer.unit_ids) == 0:
             return
 
-        required_extensions = ("waveforms", "correlograms")
-        missing_extensions = [
-            name for name in required_extensions if not analyzer.has_extension(name)
-        ]
-        if missing_extensions:
-            raise ValueError(
-                f"Analyzer 缺少扩展 {missing_extensions}，请先在 create_analyzer() 中计算"
-            )
-
         fig_folder = Path(fig_folder)
         html_folder = fig_folder / "html"
         fig_folder.mkdir(parents=True, exist_ok=True)
         html_folder.mkdir(parents=True, exist_ok=True)
 
-        waveform_extension = analyzer.get_extension("waveforms")
-        correlogram_extension = analyzer.get_extension("correlograms")
-        all_correlograms, correlogram_bins_ms = correlogram_extension.get_data()
+        # 每类图单独检查所需扩展。缺少某个扩展时只跳过对应图，不影响其它图。
+        waveform_extension = (
+            analyzer.get_extension("waveforms") if analyzer.has_extension("waveforms") else None
+        )
+        correlogram_extension = (
+            analyzer.get_extension("correlograms")
+            if analyzer.has_extension("correlograms")
+            else None
+        )
+        all_correlograms = None
+        correlogram_bins_ms = None
+        if correlogram_extension is not None:
+            try:
+                all_correlograms, correlogram_bins_ms = correlogram_extension.get_data()
+            except Exception as exc:
+                print(f"读取 correlograms 扩展失败，跳过自相关图：{exc}")
+                correlogram_extension = None
+
+        if waveform_extension is None and correlogram_extension is None:
+            print("Analyzer 没有 waveforms 或 correlograms 扩展，跳过全部可视化。")
+            return
+
+        principal_components_extension = (
+            analyzer.get_extension("principal_components")
+            if analyzer.has_extension("principal_components")
+            else None
+        )
+        pca_projection = None
+        random_spikes = None
+        if principal_components_extension is not None:
+            try:
+                pca_projection = np.asarray(principal_components_extension.get_data())
+                random_spikes_extension = (
+                    analyzer.get_extension("random_spikes")
+                    if analyzer.has_extension("random_spikes")
+                    else None
+                )
+                if random_spikes_extension is not None:
+                    random_spikes = random_spikes_extension.get_random_spikes()
+                if (
+                    pca_projection.ndim not in (2, 3)
+                    or pca_projection.shape[0] != len(random_spikes)
+                    or pca_projection.shape[1] < 2
+                ):
+                    raise ValueError("principal_components 数据维度不足以绘制二维 PCA")
+            except Exception as exc:
+                print(f"读取 principal_components 扩展失败，跳过 group PCA 图：{exc}")
+                pca_projection = None
+                random_spikes = None
+
         sampling_frequency = float(analyzer.sampling_frequency)
 
         def select_evenly(waveforms, max_count):
@@ -1268,18 +1704,25 @@ class SpikeSortingPipeline:
             """将指定 Unit 的自相关计数绘制到指定坐标轴。"""
             unit_index = analyzer.sorting.id_to_index(unit_id)
             autocorrelogram = all_correlograms[unit_index, unit_index]
+            bin_widths = np.diff(correlogram_bins_ms)
             axis.bar(
                 correlogram_bins_ms[:-1],
                 autocorrelogram,
-                width=np.diff(correlogram_bins_ms),
+                width=bin_widths * 0.92,
                 align="edge",
-                color="orangered",
-                edgecolor="none",
+                color="#2a9d8f",
+                alpha=0.9,
+                edgecolor="white",
+                linewidth=0.25,
             )
+            axis.axvline(0.0, color="#264653", linewidth=0.9, alpha=0.8)
             axis.set_title(f"Unit {unit_id} autocorrelogram")
             axis.set_xlabel("Lag (ms)")
             axis.set_ylabel("Spike-pair count")
-            axis.grid(axis="y", alpha=0.18)
+            axis.grid(axis="y", alpha=0.22, linewidth=0.7)
+            axis.set_axisbelow(True)
+            axis.spines["top"].set_visible(False)
+            axis.spines["right"].set_visible(False)
 
         def create_waveform_html_figure(
             time_ms,
@@ -1358,8 +1801,11 @@ class SpikeSortingPipeline:
                     go.Bar(
                         x=bin_centers_ms,
                         y=autocorrelogram,
-                        width=np.diff(correlogram_bins_ms),
-                        marker_color="orangered",
+                        width=np.diff(correlogram_bins_ms) * 0.92,
+                        marker={
+                            "color": "#2a9d8f",
+                            "line": {"color": "rgba(255,255,255,0.75)", "width": 0.35},
+                        },
                         hovertemplate="Lag: %{x:.2f} ms<br>Count: %{y}<extra></extra>",
                     )
                 ]
@@ -1369,20 +1815,213 @@ class SpikeSortingPipeline:
                 xaxis_title="Lag (ms)",
                 yaxis_title="Spike-pair count",
                 template="plotly_white",
+                bargap=0.04,
+                hovermode="x unified",
                 width=800,
                 height=500,
+                margin={"l": 70, "r": 30, "t": 75, "b": 65},
+            )
+            figure.add_vline(x=0.0, line_width=1, line_color="#264653")
+            return figure
+
+        def create_group_waveform_html_figure(group_name, group_waveforms):
+            """将同一 group 内各 Unit 的单次波形绘制到同一 Plotly 图。
+
+            每个 Unit 的波形合并成一个 Scattergl trace，并用 NaN 分隔不同波形；
+            这样既能展示单次波形，又不会为每条曲线创建一个浏览器对象。
+            """
+            colors = [
+                "#264653", "#e76f51", "#2a9d8f", "#f4a261", "#457b9d",
+                "#6a4c93", "#d62828", "#2b9348", "#ff006e", "#8338ec",
+            ]
+            figure = go.Figure()
+            for index, (unit_id, time_ms, shown_waveforms_uv, median_waveform_uv, peak_channel_id) in enumerate(
+                group_waveforms
+            ):
+                color = colors[index % len(colors)]
+                waveform_count, sample_count = shown_waveforms_uv.shape
+                segmented_time = np.full(
+                    (waveform_count, sample_count + 1), np.nan, dtype="float32"
+                )
+                segmented_voltage = np.full_like(segmented_time, np.nan)
+                segmented_time[:, :sample_count] = time_ms
+                segmented_voltage[:, :sample_count] = shown_waveforms_uv
+                figure.add_trace(
+                    go.Scattergl(
+                        x=segmented_time.ravel(),
+                        y=segmented_voltage.ravel(),
+                        mode="lines",
+                        name=f"{unit_id} waveforms",
+                        line={"color": color, "width": 0.75},
+                        opacity=0.32,
+                        connectgaps=False,
+                        hoverinfo="skip",
+                        showlegend=False,
+                    )
+                )
+                figure.add_trace(
+                    go.Scattergl(
+                        x=time_ms,
+                        y=median_waveform_uv,
+                        mode="lines",
+                        name=str(unit_id),
+                        line={"color": color, "width": 2.5},
+                        hovertemplate=(
+                            f"Unit {unit_id}"
+                            "<br>Time: %{x:.3f} ms<br>Voltage: %{y:.2f} μV"
+                            "<extra></extra>"
+                        ),
+                    )
+                )
+            figure.add_vline(x=0.0, line_width=1, line_dash="dash", line_color="#6c757d")
+            figure.update_layout(
+                title=f"Group {group_name} peak-channel waveforms",
+                xaxis_title="Time relative to spike (ms)",
+                yaxis_title="Voltage (μV)",
+                template="plotly_white",
+                hovermode="x unified",
+                width=1000,
+                height=650,
+                margin={"l": 70, "r": 30, "t": 75, "b": 65},
+                legend={"title": {"text": "Unit ID"}},
+            )
+            return figure
+
+        def get_unit_pca_points(unit_id):
+            """获取一个 Unit 的二维 PCA 投影，并与随机波形一一对应。"""
+            if pca_projection is None or random_spikes is None:
+                return None
+            unit_index = analyzer.sorting.id_to_index(unit_id)
+            unit_mask = random_spikes["unit_index"] == unit_index
+            projection = pca_projection[unit_mask]
+            if projection.shape[0] == 0:
+                return None
+            if projection.ndim == 2:
+                return projection[:, :2].astype("float32", copy=False)
+
+            # by_channel_local/by_channel_global 的投影还包含通道维度。
+            # 优先选该 Unit 的 peak channel；取不到时才对通道维度求均值。
+            local_channel_index = None
+            try:
+                if analyzer.sparsity is None:
+                    peak_channel_index = int(
+                        np.flatnonzero(analyzer.channel_ids ==
+                                       get_peak_channel_waveforms_uv(unit_id)[2])[0]
+                    )
+                    local_channel_index = peak_channel_index
+                else:
+                    channel_indices = np.asarray(
+                        analyzer.sparsity.unit_id_to_channel_indices[unit_id]
+                    )
+                    peak_channel_id = get_peak_channel_waveforms_uv(unit_id)[2]
+                    peak_global_index = int(
+                        np.flatnonzero(analyzer.channel_ids == peak_channel_id)[0]
+                    )
+                    matches = np.flatnonzero(channel_indices == peak_global_index)
+                    if matches.size:
+                        local_channel_index = int(matches[0])
+            except Exception:
+                local_channel_index = None
+
+            if (
+                local_channel_index is not None
+                and local_channel_index < projection.shape[2]
+            ):
+                return projection[:, :2, local_channel_index].astype(
+                    "float32", copy=False
+                )
+            return np.nanmean(projection[:, :2, :], axis=2).astype(
+                "float32", copy=False
+            )
+
+        def create_group_pca_html_figure(group_name, group_pca_points):
+            """绘制同一 group 内各 Unit 的二维 PCA 投影。"""
+            colors = [
+                "#264653", "#e76f51", "#2a9d8f", "#f4a261", "#457b9d",
+                "#6a4c93", "#d62828", "#2b9348", "#ff006e", "#8338ec",
+            ]
+            figure = go.Figure()
+            for index, (unit_id, points) in enumerate(group_pca_points):
+                color = colors[index % len(colors)]
+                figure.add_trace(
+                    go.Scattergl(
+                        x=points[:, 0],
+                        y=points[:, 1],
+                        mode="markers",
+                        name=str(unit_id),
+                        marker={"color": color, "size": 5, "opacity": 0.65},
+                        hovertemplate=(
+                            f"Unit {unit_id}"
+                            "<br>PC1: %{x:.3f}<br>PC2: %{y:.3f}<extra></extra>"
+                        ),
+                    )
+                )
+            figure.update_layout(
+                title=f"Group {group_name} two-dimensional PCA",
+                xaxis_title="PC1",
+                yaxis_title="PC2",
+                template="plotly_white",
+                hovermode="closest",
+                width=900,
+                height=700,
+                margin={"l": 70, "r": 30, "t": 75, "b": 65},
+                legend={"title": {"text": "Unit ID"}},
             )
             return figure
 
         print("开始生成可视化图表...")
-        for unit_id in analyzer.unit_ids:
+        group_waveforms = {}
+        group_pca_points = {}
+        unit_groups = None
+        if plot_group_waveforms and waveform_extension is not None:
+            try:
+                unit_groups = analyzer.sorting.get_property("group")
+                if unit_groups is None or len(unit_groups) != len(analyzer.unit_ids):
+                    print("Sorting 缺少与 Unit 对应的 group 属性，跳过 group 波形图。")
+                    unit_groups = None
+            except Exception as exc:
+                print(f"读取 Unit group 属性失败，跳过 group 波形图：{exc}")
+
+        for unit_index, unit_id in enumerate(analyzer.unit_ids):
             print(f"  处理 Unit {unit_id}...")
-            waveforms_uv, median_waveform_uv, peak_channel_id, time_ms = (
-                get_peak_channel_waveforms_uv(unit_id)
-            )
-            total_count = waveforms_uv.shape[0]
-            html_waveforms = select_evenly(waveforms_uv, max_waveforms_html)
-            png_waveforms = select_evenly(waveforms_uv, max_waveforms_png)
+            waveforms_uv = None
+            median_waveform_uv = None
+            peak_channel_id = None
+            time_ms = None
+            if waveform_extension is not None:
+                try:
+                    waveforms_uv, median_waveform_uv, peak_channel_id, time_ms = (
+                        get_peak_channel_waveforms_uv(unit_id)
+                    )
+                except Exception as exc:
+                    print(f"    Unit {unit_id} 的 waveform 图跳过：{exc}")
+
+            if (
+                plot_group_waveforms
+                and unit_groups is not None
+                and median_waveform_uv is not None
+            ):
+                group_name = str(unit_groups[unit_index])
+                group_waveforms.setdefault(group_name, []).append(
+                    (
+                        unit_id,
+                        time_ms,
+                        select_evenly(waveforms_uv, max_waveforms_group),
+                        median_waveform_uv,
+                        peak_channel_id,
+                    )
+                )
+                if pca_projection is not None and random_spikes is not None:
+                    try:
+                        pca_points = get_unit_pca_points(unit_id)
+                        if pca_points is not None:
+                            group_pca_points.setdefault(group_name, []).append(
+                                (unit_id, select_evenly(pca_points, max_waveforms_group))
+                            )
+                    except Exception as exc:
+                        print(f"    Unit {unit_id} 的 PCA 投影跳过：{exc}")
+
+            total_count = analyzer.sorting.get_unit_spike_train(unit_id=unit_id).shape[0]
 
             # 清理旧版本可能遗留、但新版本不再需要的图表。
             for stale_path in (
@@ -1392,59 +2031,110 @@ class SpikeSortingPipeline:
                 if stale_path.exists():
                     stale_path.unlink()
 
-            # 1. waveform HTML：WebGL 加单 trace，适合数百条 waveform。
-            waveform_html_figure = create_waveform_html_figure(
-                time_ms,
-                html_waveforms,
-                median_waveform_uv,
-                unit_id,
-                peak_channel_id,
-                total_count,
-            )
-            waveform_html_figure.write_html(
-                html_folder / f"{unit_id}_waveforms.html",
-                include_plotlyjs="cdn",
-                full_html=True,
-                config={"scrollZoom": True, "displaylogo": False},
-            )
-
-            # 2. autocorrelogram HTML。
-            autocorr_html_figure = create_autocorrelogram_html_figure(unit_id)
-            autocorr_html_figure.write_html(
-                html_folder / f"{unit_id}_autocorr.html",
-                include_plotlyjs="cdn",
-                full_html=True,
-                config={"scrollZoom": True, "displaylogo": False},
-            )
-
-            # 3. 直接绘制两个子图，避免先截图再拼接造成的额外内存开销。
-            combined_figure, (waveform_axis, autocorr_axis) = plt.subplots(
-                1, 2, figsize=(15, 5.5)
-            )
-            try:
-                plot_waveforms(
-                    waveform_axis,
+            # 1. waveform HTML：只有计算了 waveforms 扩展时才生成。
+            if waveforms_uv is not None:
+                html_waveforms = select_evenly(waveforms_uv, max_waveforms_html)
+                png_waveforms = select_evenly(waveforms_uv, max_waveforms_png)
+                waveform_html_figure = create_waveform_html_figure(
                     time_ms,
-                    png_waveforms,
+                    html_waveforms,
                     median_waveform_uv,
                     unit_id,
                     peak_channel_id,
                     total_count,
                 )
-                plot_autocorrelogram(autocorr_axis, unit_id)
-                combined_figure.subplots_adjust(
-                    left=0.07,
-                    right=0.98,
-                    bottom=0.13,
-                    top=0.89,
-                    wspace=0.25,
+                waveform_html_figure.write_html(
+                    html_folder / f"{unit_id}_waveforms.html",
+                    include_plotlyjs="cdn",
+                    full_html=True,
+                    config={"scrollZoom": True, "displaylogo": False},
                 )
-                combined_figure.savefig(
-                    fig_folder / f"{unit_id}_abstract.png",
-                    dpi=300,
+
+            # 2. autocorrelogram HTML：只有计算了 correlograms 扩展时才生成。
+            autocorr_available = False
+            if correlogram_extension is not None:
+                try:
+                    autocorr_html_figure = create_autocorrelogram_html_figure(unit_id)
+                    autocorr_html_figure.write_html(
+                        html_folder / f"{unit_id}_autocorr.html",
+                        include_plotlyjs="cdn",
+                        full_html=True,
+                        config={"scrollZoom": True, "displaylogo": False},
+                    )
+                    autocorr_available = True
+                except Exception as exc:
+                    print(f"    Unit {unit_id} 的自相关图跳过：{exc}")
+
+            # 3. PNG 只绘制已经计算出的子图；两个扩展都缺失时不生成 PNG。
+            available_plots = int(waveforms_uv is not None) + int(autocorr_available)
+            if available_plots > 0:
+                combined_figure, axes = plt.subplots(
+                    1,
+                    available_plots,
+                    figsize=(7.5 * available_plots, 5.5),
+                    squeeze=False,
                 )
-            finally:
-                plt.close(combined_figure)
+                axes = axes[0]
+                axis_index = 0
+                try:
+                    if waveforms_uv is not None:
+                        plot_waveforms(
+                            axes[axis_index],
+                            time_ms,
+                            png_waveforms,
+                            median_waveform_uv,
+                            unit_id,
+                            peak_channel_id,
+                            total_count,
+                        )
+                        axis_index += 1
+                    if autocorr_available:
+                        try:
+                            plot_autocorrelogram(axes[axis_index], unit_id)
+                        except Exception as exc:
+                            print(f"    Unit {unit_id} 的 PNG 自相关子图跳过：{exc}")
+                    combined_figure.subplots_adjust(
+                        left=0.07,
+                        right=0.98,
+                        bottom=0.13,
+                        top=0.89,
+                        wspace=0.25,
+                    )
+                    combined_figure.savefig(
+                        fig_folder / f"{unit_id}_abstract.png",
+                        dpi=300,
+                    )
+                finally:
+                    plt.close(combined_figure)
+
+        # group 汇总图展示每个 Unit 抽样后的单次波形及中位波形，不添加分类参数框。
+        if group_waveforms:
+            for group_name, group_data in group_waveforms.items():
+                safe_group_name = "".join(
+                    char if char.isalnum() or char in ("-", "_") else "_"
+                    for char in group_name
+                )
+                group_figure = create_group_waveform_html_figure(group_name, group_data)
+                group_figure.write_html(
+                    html_folder / f"group_{safe_group_name}_waveforms.html",
+                    include_plotlyjs="cdn",
+                    full_html=True,
+                    config={"scrollZoom": True, "displaylogo": False},
+                )
+
+        if group_pca_points:
+            for group_name, group_data in group_pca_points.items():
+                safe_group_name = "".join(
+                    char if char.isalnum() or char in ("-", "_") else "_"
+                    for char in group_name
+                )
+                pca_figure = create_group_pca_html_figure(group_name, group_data)
+                pca_figure.write_html(
+                    html_folder / f"group_{safe_group_name}_pca.html",
+                    include_plotlyjs="cdn",
+                    full_html=True,
+                    config={"scrollZoom": True, "displaylogo": False},
+                )
 
     def export_to_phy(self, analyzer_folder, output_folder):
         """
@@ -1460,7 +2150,6 @@ class SpikeSortingPipeline:
         import spikeinterface as si
         import spikeinterface.exporters as ex
         import yyl_utils as yyl
-        import pandas as pd
 
         yyl.check_delete_exists_path(output_folder)
 
@@ -1470,16 +2159,6 @@ class SpikeSortingPipeline:
             output_folder=output_folder,
             remove_if_exists=True
         )
-
-        def label_all_good(tsv_path):
-            """将Phy中的所有单元标记为good"""
-            df = pd.read_csv(tsv_path, sep='\t')
-            df['group'] = 'good'
-            df.to_csv(tsv_path, sep='\t', index=False)
-
-        # 修改cluster_group.tsv文件，将所有单元标记为good
-        # cellexplorer只会读取标记为good的unit
-        label_all_good(output_folder / 'cluster_group.tsv')
 
     def run_cell_explorer(self, phy_folder, matlab_function_path, output_metrics_path):
         """
@@ -1501,6 +2180,25 @@ class SpikeSortingPipeline:
         import yyl_utils as yyl
         import os
         import joblib
+        import pandas as pd
+        from pathlib import Path
+
+        # CellExplorer 只读取 cluster_group.tsv 中 group=good 的 Unit。
+        # 因此在调用 MATLAB 管道前，将 Phy 导出的所有 Unit 标记为 good。
+        def label_all_good(tsv_path):
+            """将 Phy 中的所有单元标记为 good。"""
+            tsv_path = Path(tsv_path)
+            if not tsv_path.exists():
+                print(f"未找到 {tsv_path}，跳过 Phy Unit good 标记。")
+                return
+            df = pd.read_csv(tsv_path, sep="\t")
+            if "group" not in df.columns:
+                print(f"{tsv_path} 中没有 group 列，跳过 Phy Unit good 标记。")
+                return
+            df["group"] = "good"
+            df.to_csv(tsv_path, sep="\t", index=False)
+
+        label_all_good(Path(phy_folder) / "cluster_group.tsv")
 
         # 内部MATLAB管道类
         class _MatlabPipeline:
@@ -1593,7 +2291,7 @@ class SpikeSortingPipeline:
         config=None,
         traces_config=None,
         n_jobs=-1,
-        run_until_step=None,
+        run_until_step=7,
     ):
         """
         按顺序运行 spike sorting 全流程，并可在指定步骤完成后停止。
@@ -1603,30 +2301,45 @@ class SpikeSortingPipeline:
         probe : Probe | None, default: None
             探针结构。可以通过 ``SpikeSortingPipeline.get_probe()`` 创建。
         config : dict | None, default: None
-            管道配置。支持以下键：
+            管道配置。支持以下键（未提供时使用相应函数的默认值）：
 
             - ``sorter_name``：sorter 名称，默认 ``"mountainsort5"``。
             - ``sorting_params``：sorter 参数；未提供时读取该 sorter 的默认值。
             - ``extensions_dict``：Analyzer 扩展参数；None 使用本项目默认配置。
-            - ``preprocess_pipeline_dict``：预处理 Pipeline；None 使用项目默认
-              流程，空字典表示跳过所有预处理操作。
-            - ``classify_units``：是否推断细胞类型，默认 True。
+            - ``preprocess_pipeline_dict``：预处理 Pipeline；None 使用项目默认流程，
+              空字典表示跳过所有预处理操作。
+            - ``sorting_in_docker``：是否使用docker进行sorting。注意python需安装docker包，
+              且docker需打开。
             - ``max_waveforms_html``：每个 Unit 的 HTML 最多绘制多少条波形，
-              默认 500。
+              默认 2000。
             - ``max_waveforms_png``：每个 Unit 的 PNG 最多绘制多少条波形，
-              默认 500。
-            - ``run_cell_explorer``：是否运行 CellExplorer，默认 False。
-            - ``run_until_step``：也可在 config 中指定停止步骤；函数参数
-              ``run_until_step`` 的优先级更高。
+              默认 2000。
+            - ``max_waveforms_group``：每个 Unit 在 group waveform 和 group PCA
+              HTML 中最多绘制多少条波形/投影点，默认 2000。
+            ``sorting_params``、``extensions_dict`` 和 ``preprocess_pipeline_dict``
+            可分别通过 ``get_all_sorting_params_dict()``、
+            ``get_all_extensions_params_dict()`` 和
+            ``get_all_preprocess_pipeline_dict()`` 查询可用参数和默认值。
         traces_config : dict | None, default: None
-            从 NumPy 数组创建 Recording 时使用。必须包含 ``traces``、``fs``、
-            ``chan_ids``；可选 ``metadata_folder`` 和 ``properties``。未提供时
-            从 ``self.input_file`` 指向的 PLX 文件读取。
+            从 NumPy 数组创建 Recording 时使用。传入该字典后，不再从 PLX 文件读取。
+            字典中的字段如下：
+
+            - ``traces`` (np.ndarray)：神经信号数据，形状为
+              ``(n_samples, n_channels)``；默认单位为 μV，该单位会影响后续阈值、
+              去噪和波形绘图。
+            - ``fs`` (float)：采样频率，单位 Hz。
+            - ``chan_ids`` (list)：通道 ID 列表，长度必须等于 ``n_channels``。
+            - ``metadata_folder`` (str | Path | None)：可选的元数据文件夹，包含
+              通道增益等 Recording 元数据。
+            - ``properties`` (dict | None)：可选的 Recording 属性字典，例如 LSB
+              等信号处理属性。
+            如果 ``traces_config`` 为 None，则从 ``self.input_file`` 指向的 PLX 文件读取。
         n_jobs : int, default: -1
             支持并行的步骤所使用的任务数；-1 表示使用全部可用核心。
-        run_until_step : int | str | None, default: None
+        run_until_step : int | str | None, default: 7
             控制管道运行到哪个步骤后停止。可以传 1～8，也可以传下面列出的
-            英文步骤名。None 表示运行到最后一个可用步骤。
+            英文步骤名。默认运行到步骤 7（导出 Phy），不会自动启动 CellExplorer；
+            传入 8 或 ``"cell_explorer"`` 才会继续执行 CellExplorer。
 
         Returns
         -------
@@ -1638,16 +2351,15 @@ class SpikeSortingPipeline:
         2. ``preprocess``：应用预处理 Pipeline 并保存结果。
         3. ``sorting``：运行 sorter 并保存 Sorting。
         4. ``create_analyzer``：创建 Analyzer、计算 extensions、导出指标表格。
-        5. ``visualize``：生成 waveform 和自相关 HTML/PNG。
-        6. ``renew_unit_type``：质量筛选并可选推断细胞类型。
+        5. ``renew_unit_type``：质量筛选并可选推断细胞类型。
+        6. ``visualize``：生成 waveform、自相关和 group 汇总 HTML/PNG。
         7. ``export_to_phy``：导出 Phy 文件。
-        8. ``cell_explorer``：按配置选择是否运行 MATLAB CellExplorer。
+        8. ``cell_explorer``：在 ``run_until_step=8`` 且 MATLAB Engine 可用时运行。
 
         Notes
         -----
         ``run_until_step`` 只控制“在哪里停止”，不会跳过前面的步骤。例如传入
-        4 会依次完成步骤 1～4，然后返回。CellExplorer 还需要
-        ``config["run_cell_explorer"]`` 为 True 且 MATLAB Engine 可用。
+        4 会依次完成步骤 1～4，然后返回。CellExplorer 还需要 MATLAB Engine 可用。
         """
         if config is None:
             config = {}
@@ -1659,18 +2371,15 @@ class SpikeSortingPipeline:
             2: "preprocess",
             3: "sorting",
             4: "create_analyzer",
-            5: "visualize",
-            6: "renew_unit_type",
+            5: "renew_unit_type",
+            6: "visualize",
             7: "export_to_phy",
             8: "cell_explorer",
         }
         step_numbers = {name: number for number, name in step_names.items()}
 
-        requested_step = run_until_step
-        if requested_step is None:
-            requested_step = config.get("run_until_step", 8)
-        if requested_step is None:
-            requested_step = 8
+        # run_until_step 只从函数参数传入，不再从 config 读取。
+        requested_step = 7 if run_until_step is None else run_until_step
 
         if isinstance(requested_step, str):
             normalized_step = requested_step.strip().lower()
@@ -1704,10 +2413,14 @@ class SpikeSortingPipeline:
             sorting_params = self._get_current_sorting_params_dict(sorter_name)
         extensions_dict = config.get("extensions_dict")
         preprocess_pipeline_dict = config.get("preprocess_pipeline_dict")
-        classify_units = config.get("classify_units", True)
-        max_waveforms_html = config.get("max_waveforms_html", 500)
-        max_waveforms_png = config.get("max_waveforms_png", 500)
-        run_cell_explorer = config.get("run_cell_explorer", False)
+        run_in_docker = config.get("run_in_docker")
+        max_waveforms_html = config.get("max_waveforms_html", 2000)
+        max_waveforms_png = config.get("max_waveforms_png", 2000)
+        max_waveforms_group = config.get("max_waveforms_group", 2000)
+        # run_pipeline 固定一次只运行一个 group sorter。Kilosort4 通常使用 GPU，
+        # 固定为 1 可以避免多个任务同时争抢显存。直接调用 perform_sorting() 时，
+        # 仍可通过其 group_n_jobs 参数自行控制 joblib 并行数。
+        group_n_jobs = 1
 
         print(f"本次管道计划运行到步骤 {final_step}/8 ({step_names[final_step]})。")
 
@@ -1744,12 +2457,28 @@ class SpikeSortingPipeline:
             return
 
         print("步骤 3/8：执行 spike sorting...")
-        self.perform_sorting(
-            self.output_paths.preprocessed_recording_folder,
-            sorter_name,
-            self.output_paths.sorting_object_folder,
-            sorting_params,
-        )
+        try:
+            sorting = self.perform_sorting(
+                self.output_paths.preprocessed_recording_folder,
+                sorter_name,
+                self.output_paths.sorting_object_folder,
+                sorting_params,
+                run_in_docker=run_in_docker,
+                group_n_jobs=group_n_jobs,
+            )
+        except Exception as exc:
+            print(f"步骤 3 sorting 失败：{exc}")
+            print("当前 setting 已停止，跳过 Analyzer、扩展计算和后续步骤。")
+            return
+
+        # 某些 group 可能没有任何 spike。此时 perform_sorting() 会返回空
+        # NumpySorting；不要将空 sorting 交给 Analyzer，以免扩展内部对空数组
+        # 调用 np.concatenate([]) 而再次报错。
+        if sorting is None or len(sorting.unit_ids) == 0:
+            print("步骤 3 完成，但没有任何有效 Unit。")
+            print("跳过 Analyzer、质量指标、可视化、Phy 和 CellExplorer。")
+            return
+
         if stop_after(3):
             return
 
@@ -1768,22 +2497,21 @@ class SpikeSortingPipeline:
             if stop_after(4):
                 return
 
-            # 可视化紧跟 Analyzer 创建；后续分类或 Phy 导出失败时，图表仍已生成。
-            print("步骤 5/8：生成 waveform 和自相关图表...")
+            print("步骤 5/8：更新 Unit 质量和细胞类型结果...")
+            self.renew_unit_type(
+                self.output_paths.sorting_analyzer_folder,
+                self.output_paths.cell_type_metrics_path,
+            )
+            if stop_after(5):
+                return
+
+            print("步骤 6/8：生成 waveform、自相关和 group 汇总图表...")
             self.visualize_results(
                 self.output_paths.sorting_analyzer_folder,
                 fig_folder=self.output_paths.figures_folder / "waveform_figures",
                 max_waveforms_html=max_waveforms_html,
                 max_waveforms_png=max_waveforms_png,
-            )
-            if stop_after(5):
-                return
-
-            print("步骤 6/8：更新 Unit 质量和细胞类型结果...")
-            self.renew_unit_type(
-                self.output_paths.sorting_analyzer_folder,
-                self.output_paths.cell_type_metrics_path,
-                classify_units=classify_units,
+                max_waveforms_group=max_waveforms_group,
             )
             if stop_after(6):
                 return
@@ -1797,9 +2525,7 @@ class SpikeSortingPipeline:
                 return
 
             print("步骤 8/8：检查并运行 CellExplorer...")
-            if not run_cell_explorer:
-                print("run_cell_explorer=False，跳过 CellExplorer。")
-            elif not self._matlab_available:
+            if not self._matlab_available:
                 print("MATLAB Engine 不可用，跳过 CellExplorer。")
             else:
                 self.run_cell_explorer(
