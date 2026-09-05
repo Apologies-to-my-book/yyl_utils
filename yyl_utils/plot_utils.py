@@ -3,9 +3,201 @@ import matplotlib.font_manager as fm
 import os
 from typing import Union,Iterable
 import pandas as pd
+from pathlib import Path
 from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     import numpy as np
+
+
+def plot_units_waveforms(
+    waveforms,
+    unit_ids=None,
+    sampling_frequency=30000,
+    backend="matplotlib",
+    figure_path=None,
+    show_figure=False,
+    max_waveforms=2000,
+    y_lim=None,
+):
+    """
+    绘制多个 Unit 的 waveform。
+
+    Args:
+        waveforms: list，每个元素是一个形状为 (n_counts, n_samples) 的数组，
+            每个数组代表一个 Unit 的 waveform，单位为 uV。
+        unit_ids: Unit ID 列表。传入 None 时，使用 Unit 在列表中的索引作为 ID。
+        sampling_frequency: 采样率，单位为 Hz，默认 30000。
+        backend: 绘图后端，只支持 "matplotlib" 或 "plotly"。
+        figure_path: 保存图像的绝对路径。Matplotlib 根据文件扩展名保存，
+            Plotly 保存为 HTML；不传入时不保存。
+        show_figure: 是否显示图像。只有 backend="matplotlib" 时生效，默认 False。
+        max_waveforms: 每个 Unit 最多显示的单次波形数，默认 2000。
+        y_lim: Y 轴范围，格式为 (y_min, y_max)，单位为 uV，默认为None时自动适应范围。
+
+    Returns:
+        Matplotlib Figure 或 Plotly Figure。
+    """
+    import colorsys
+
+    import numpy as np
+    unit_count = len(waveforms)
+    if unit_ids is None:
+        unit_ids = range(unit_count)
+
+    sample_count = waveforms[0].shape[1]
+    time_ms = np.arange(sample_count) / sampling_frequency * 1000
+
+    def get_unit_color(unit_index):
+        """按照 Unit 编号生成可区分的颜色。"""
+        red, green, blue = colorsys.hsv_to_rgb(unit_index / unit_count, 0.75, 0.85)
+        return f"#{round(red * 255):02x}{round(green * 255):02x}{round(blue * 255):02x}"
+
+    def get_waveform_colors(unit_index):
+        """获取单次 waveform 和中位 waveform 的颜色。"""
+        if unit_count == 1:
+            return "#505050", "orangered"
+        unit_color = get_unit_color(unit_index)
+        return unit_color, unit_color
+
+    if backend == "matplotlib":
+        import matplotlib.pyplot as plt
+
+        figure, axis = plt.subplots(figsize=(10, 6))
+
+        for unit_index, unit_id in enumerate(unit_ids):
+            unit_waveforms = np.asarray(waveforms[unit_index])
+            waveform_count = unit_waveforms.shape[0]
+            if waveform_count > max_waveforms:
+                shown_indices = np.linspace(
+                    0, waveform_count - 1, max_waveforms, dtype=int
+                )
+            else:
+                shown_indices = np.arange(waveform_count)
+
+            waveform_color, median_color = get_waveform_colors(unit_index)
+            axis.plot(
+                time_ms,
+                unit_waveforms[shown_indices].T,
+                color=waveform_color,
+                alpha=0.16,
+                linewidth=0.55,
+            )
+            axis.plot(
+                time_ms,
+                np.median(unit_waveforms, axis=0),
+                color=median_color,
+                linewidth=2.2,
+                label=f"Unit {unit_id}",
+                zorder=3,
+            )
+
+        axis.set_title(
+            f"Waveforms of {unit_count} Units | "
+            f"maximum {max_waveforms} waveforms per Unit"
+        )
+        axis.set_xlabel("Time (ms)")
+        axis.set_ylabel("Voltage (uV)")
+        if y_lim:
+            axis.set_ylim(y_lim)
+        axis.grid(alpha=0.18)
+        axis.legend(loc="best")
+        figure.tight_layout()
+
+        if figure_path is not None:
+            figure_path = Path(figure_path)
+            figure_path.parent.mkdir(parents=True, exist_ok=True)
+            figure.savefig(figure_path, dpi=300)
+
+        if show_figure:
+            plt.show()
+        else:
+            plt.close(figure)
+
+        return figure
+
+    if backend == "plotly":
+        from plotly.subplots import make_subplots
+        import plotly.graph_objects as go
+
+        figure = make_subplots(rows=1, cols=1)
+
+        for unit_index, unit_id in enumerate(unit_ids):
+            unit_waveforms = np.asarray(waveforms[unit_index])
+            waveform_count = unit_waveforms.shape[0]
+            shown_count = min(waveform_count, max_waveforms)
+            if waveform_count > max_waveforms:
+                shown_indices = np.linspace(
+                    0, waveform_count - 1, max_waveforms, dtype=int
+                )
+            else:
+                shown_indices = np.arange(waveform_count)
+
+            shown_waveforms = unit_waveforms[shown_indices]
+            waveform_color, median_color = get_waveform_colors(unit_index)
+
+            # 将所有单次波形合并成一个 Scattergl trace，NaN 用来分隔不同曲线。
+            separated_time = np.full(
+                (shown_count, sample_count + 1), np.nan, dtype=float
+            )
+            separated_voltage = np.full_like(separated_time, np.nan)
+            separated_time[:, :sample_count] = time_ms
+            separated_voltage[:, :sample_count] = shown_waveforms
+
+            figure.add_trace(
+                go.Scattergl(
+                    x=separated_time.ravel(),
+                    y=separated_voltage.ravel(),
+                    mode="lines",
+                    line={"color": waveform_color, "width": 0.7},
+                    opacity=0.22,
+                    name=f"Unit {unit_id} waveforms",
+                    hoverinfo="skip",
+                    connectgaps=False,
+                    showlegend=False,
+                ),
+                row=1,
+                col=1,
+            )
+            figure.add_trace(
+                go.Scattergl(
+                    x=time_ms,
+                    y=np.median(unit_waveforms, axis=0),
+                    mode="lines",
+                    line={"color": median_color, "width": 2.5},
+                    name=f"Unit {unit_id}",
+                    showlegend=True,
+                ),
+                row=1,
+                col=1,
+            )
+
+        figure.update_xaxes(title_text="Time (ms)", row=1, col=1)
+        if y_lim:
+            figure.update_yaxes(
+                title_text="Voltage (uV)", range=list(y_lim), row=1, col=1
+            )
+        else:
+            figure.update_yaxes(
+                title_text="Voltage (uV)", row=1, col=1
+            )
+        figure.update_layout(
+            title=(
+                f"Waveforms of {unit_count} Units | "
+                f"maximum {max_waveforms} waveforms per Unit"
+            ),
+            height=600,
+            template="plotly_white",
+            hovermode="x unified",
+        )
+
+        if figure_path is not None:
+            figure_path = Path(figure_path)
+            figure_path.parent.mkdir(parents=True, exist_ok=True)
+            figure.write_html(str(figure_path), include_plotlyjs="cdn")
+
+        return figure
+
+    raise ValueError('backend 只能是 "matplotlib" 或 "plotly"')
 
 class LargeDataSlidePlot:
     def __init__(self, data: np.ndarray, time_stamp: np.ndarray, points_overview: int = 30000,

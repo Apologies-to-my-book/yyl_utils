@@ -18,6 +18,7 @@ get_all_preprocess_pipeline_dict() 用于查询当前 SpikeInterface 支持的�
 """
 
 from __future__ import annotations
+import shutil
 from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from probeinterface import Probe
@@ -49,6 +50,7 @@ class _PipelineOutputPaths:
         self.sorting_verbose_folder = base_folder / 'sorting_verbose_folder'
         self.sorting_object_folder = base_folder / 'sorting_object_folder'
         self.sorting_analyzer_folder = base_folder / 'sorting_analyzer_folder'
+        self.cache_folder = base_folder / 'cache_folder'
         self.phy_folder = base_folder / 'phy_folder'
         self.figures_folder = base_folder / 'figures_folder'
         self.qm_excel_path = base_folder / 'qm_excel.xlsx'
@@ -59,7 +61,7 @@ class _PipelineOutputPaths:
 class _ParameterCatalogMixin:
     """按职责组织的 ParameterCatalog 操作。重型依赖保持方法内懒加载。"""
     @staticmethod
-    def get_all_sorting_params_dict(sorter_name=None, print_all_sorters=True):
+    def get_all_sorting_params_dict(sorter_name=None, print_all_sorters=False):
         """
         查询 sorter 的官方默认参数，并可同时打印全部可用 sorter。
 
@@ -68,7 +70,7 @@ class _ParameterCatalogMixin:
         sorter_name : str | None, default: None
             需要查询参数的 sorter 名称，例如 ``mountainsort5``。None 时只打印
             sorter 列表并返回空字典。
-        print_all_sorters : bool, default: True
+        print_all_sorters : bool, default: False
             是否打印全部可用和已安装的 sorter。
 
         Returns
@@ -142,8 +144,6 @@ class _ParameterCatalogMixin:
                 print(f"    {param_name}: {param_desc}")
 
             print("\n" + "=" * 60)
-
-
         
         if print_all_sorters:
             print_sorter_params()
@@ -645,9 +645,13 @@ class _RecordingMixin:
 
         if preprocess_pipeline_dict is None:
             preprocess_pipeline_dict = self._get_current_preprocess_pipeline_dict()
+
+        print("=="*60)
+        print("正在按字典进行预处理：")
+        print(preprocess_pipeline_dict)
+        print("=="*60)
         if not isinstance(preprocess_pipeline_dict, dict):
             raise TypeError("preprocess_pipeline_dict 必须是字典或 None")
-
         raw_recording = si.load(file_or_folder_or_dict=input_folder)
         if preprocess_pipeline_dict:
             preprocessed_recording = spre.apply_preprocessing_pipeline(
@@ -675,6 +679,7 @@ class _SortingMixin:
     def perform_sorting(
         self,
         input_folder,
+        cache_folder,
         sorter_name,
         output_folder,
         params=None,
@@ -686,11 +691,13 @@ class _SortingMixin:
 
         Parameters
         ----------
-        input_folder : str | Path
+        input_folder : Path
             预处理后的 Recording 文件夹。
+        cache_folder : Path
+            用于存储计算过程中产生的缓存文件的文件夹。
         sorter_name : str
             sorter 名称。
-        output_folder : str | Path
+        output_folder : Path
             合并后 Sorting 的保存文件夹。
         params : dict | None, default: None
             sorter 参数；None 使用 _get_current_sorting_params_dict()。
@@ -725,7 +732,6 @@ class _SortingMixin:
             params = self._get_current_sorting_params_dict(sorter_name)
         else:
             params = params.copy()
-
         if not isinstance(group_n_jobs, int) or isinstance(group_n_jobs, bool):
             raise TypeError("group_n_jobs 必须是整数")
         if group_n_jobs == -1:
@@ -741,18 +747,24 @@ class _SortingMixin:
             )
 
         output_folder = Path(output_folder)
-        output_folder.parent.mkdir(parents=True, exist_ok=True)
-        yyl.check_delete_exists_path(output_folder)
+        output_folder.mkdir(parents=True, exist_ok=True)
+        print("=="*60)
+        print("正在执行：")
+        print("sorter_name:", sorter_name)
+        print("sorting_params:")
+        print(params)
+        print("=="*60)
 
         group_values = recording.get_property("group")
         print(f"按 {len(set(group_values.tolist()))} 个 shank 分组独立运行 {sorter_name}")
 
         recording_dict = recording.split_by("group")
-
+        
         # sorter 的中间结果放入临时目录；最终 Sorting 保存完成后自动清理。
+        cache_folder.mkdir(parents=True, exist_ok=True)
         with TemporaryDirectory(
             prefix=f"{output_folder.name}_shank_sorting_",
-            dir=output_folder.parent,
+            dir=cache_folder,
             ignore_cleanup_errors=True,
         ) as sorter_working_folder:
             def run_one_group(group_name, group_recording):
@@ -775,6 +787,11 @@ class _SortingMixin:
                     return group_name, None, (
                         f"{exc}\n{traceback.format_exc()}"
                     )
+                finally:
+                    if sorter_name.lower() == "kilosort4":
+                        from kilosort.run_kilosort import close_logger
+
+                        close_logger()
 
             effective_n_jobs = min(group_n_jobs, max(1, len(recording_dict)))
             # joblib 使用独立进程执行 group sorter。每个任务都有独立输出目录，
@@ -987,6 +1004,11 @@ class _AnalyzerMixin:
             by_property="group",
         )
 
+        print("=="*60)
+        print("正在按字典计算analyzer_extensions：")
+        print(extensions_dict)
+        print("=="*60)
+
         # 一次性计算所有扩展
         if compute:
             analyzer.compute(extensions_dict, n_jobs=n_jobs)
@@ -1073,15 +1095,10 @@ class _UnitAnalysisMixin:
             # Allen Visual Coding Neuropixels 论文展示 unit 数量时使用：
             # `isi_violations < 0.5`、`amplitude_cutoff < 0.1`、`presence_ratio > 0.95`，
             # 这是一个较为认可的默认标准，参考文献doi：10.1038/s41586-020-03171-x。
-            isi_column = (
-                "isi_violations"
-                if "isi_violations" in df_qm_metrics.columns
-                else "isi_violations_ratio"
-            )
             for unit_id in screen_dict["unit_ids"]:
                 # 按 ISI 违例率、振幅截断率和存在率判定排序质量。
                 required_columns = (
-                    isi_column,
+                    "isi_violations_ratio",
                     "amplitude_cutoff",
                     "presence_ratio",
                 )
@@ -1095,7 +1112,7 @@ class _UnitAnalysisMixin:
                     # 找不到某个质量指标时不臆测好坏，Excel 中留空。
                     screen_dict["sorting_quality"].append("")
                 elif (
-                    (df_qm_metrics.loc[unit_id, isi_column] < 0.5)
+                    (df_qm_metrics.loc[unit_id, "isi_violations_ratio"] < 0.5)
                     and (df_qm_metrics.loc[unit_id, "amplitude_cutoff"] < 0.1)
                     and (df_qm_metrics.loc[unit_id, "presence_ratio"] > 0.95)
                 ):
@@ -1291,15 +1308,12 @@ class _UnitAnalysisMixin:
             # 判断神经元的推定类型
             if classify_dict["unit_ids"]:
                 for unit_id in classify_dict["unit_ids"]:
-                    # 新版 SpikeInterface 使用 peak_to_trough_duration；兼容旧表格的
-                    # peak_to_valley 列，二者含义都是波峰到波谷的时间间隔（秒）。
+                    # 新版 SpikeInterface 使用 peak_to_trough_duration列，含义是波峰到波谷的时间间隔（秒）。
                     if unit_id not in df_template_metrics.index:
                         classify_dict["putative_cell_type"].append("")
                         continue
                     if "peak_to_trough_duration" in df_template_metrics.columns:
                         duration_column = "peak_to_trough_duration"
-                    elif "peak_to_valley" in df_template_metrics.columns:
-                        duration_column = "peak_to_valley"
                     else:
                         classify_dict["putative_cell_type"].append("")
                         continue
@@ -1345,20 +1359,8 @@ class _UnitAnalysisMixin:
 
         # 将质量判断所依据的原始指标一并写入 Excel，便于回溯每个 Unit
         # 为什么被标记为 good/bad。找不到的值统一留空（NaN）。
-        isi_column = (
-            "isi_violations"
-            if "isi_violations" in df_qm_metrics.columns
-            else "isi_violations_ratio"
-            if "isi_violations_ratio" in df_qm_metrics.columns
-            else "isi_violations"
-        )
-        renew_dict[isi_column] = [
-            df_qm_metrics.loc[unit_id, isi_column]
-            if unit_id in df_qm_metrics.index and isi_column in df_qm_metrics.columns
-            else np.nan
-            for unit_id in unit_ids
-        ]
-        for metric_name in ("amplitude_cutoff", "presence_ratio"):
+        for metric_name in ("firing_rate", "num_spikes", "snr",
+                             "isi_violations_ratio", "amplitude_cutoff", "presence_ratio",):
             renew_dict[metric_name] = [
                 df_qm_metrics.loc[unit_id, metric_name]
                 if unit_id in df_qm_metrics.index and metric_name in df_qm_metrics.columns
@@ -1384,21 +1386,13 @@ class _UnitAnalysisMixin:
         else:
             print("Analyzer 缺少 template_metrics，troughToPeak 和 putative_cell_type 结果留空。")
             df_template_metrics = pd.DataFrame(index=unit_ids)
-        duration_column = (
-            "peak_to_trough_duration"
-            if "peak_to_trough_duration" in df_template_metrics.columns
-            else "peak_to_valley"
-            if "peak_to_valley" in df_template_metrics.columns
-            else None
-        )
-        renew_dict["troughToPeak"] = [
-            df_template_metrics.loc[unit_id, duration_column] * 1000
-            if duration_column is not None
-            and unit_id in df_template_metrics.index
-            and pd.notna(df_template_metrics.loc[unit_id, duration_column])
-            else np.nan
-            for unit_id in unit_ids
-        ]
+        for metric_name in ("peak_to_trough_duration", "max_channel",):
+            renew_dict[metric_name] = [
+                df_template_metrics.loc[unit_id, metric_name]
+                if unit_id in df_template_metrics.index and metric_name in df_template_metrics.columns
+                else np.nan
+                for unit_id in unit_ids
+            ]
 
         # 如果需要分类神经元类型
         if classify_units:
@@ -1414,7 +1408,15 @@ class _UnitAnalysisMixin:
             renew_dict = {**renew_dict, **classify_dict}
 
         # 将合并后的字典转换为DataFrame并保存为Excel文件
+        columns_order = ["unit_ids", "num_spikes", "firing_rate", "snr", "max_channel", "sorting_quality", 
+                          "putative_cell_type", "isi_violations_ratio", "amplitude_cutoff", "presence_ratio",
+                          "acg_tau_rise", "troughToPeak"]
+        # 只取同时存在于 DataFrame 和 columns_order 中的列（保持顺序）
         df_renew = pd.DataFrame.from_dict(renew_dict)
+        existing_cols = [col for col in columns_order if col in df_renew.columns]
+        # 保留指定列放在前面，其余列按原顺序跟在后面
+        other_cols = [col for col in df_renew.columns if col not in columns_order]
+        df_renew = df_renew[existing_cols + other_cols]
         df_renew.to_excel(cell_type_metrics_path)
 
     def perform_curation(self, analyzer_folder, model_folder):
@@ -2356,10 +2358,11 @@ class _PipelineRunnerMixin:
         config=None,
         traces_config=None,
         n_jobs=-1,
-        run_until_step=7,
+        run_step=[1, 2, 3, 4, 5, 6],
+        overwrite=True,
     ):
         """
-        按顺序运行 spike sorting 全流程，并可在指定步骤完成后停止。
+        按顺序运行 spike sorting 流程，只执行 run_step 中指定的步骤。
 
         Parameters
         ----------
@@ -2372,15 +2375,15 @@ class _PipelineRunnerMixin:
             - ``sorting_params``：sorter 参数；未提供时读取该 sorter 的默认值。
             - ``extensions_dict``：Analyzer 扩展参数；None 使用本项目默认配置。
             - ``preprocess_pipeline_dict``：预处理 Pipeline；None 使用项目默认流程，
-              空字典表示跳过所有预处理操作。
+            空字典表示跳过所有预处理操作。
             - ``sorting_in_docker``：是否使用docker进行sorting。注意python需安装docker包，
-              且docker需打开。
+            且docker需打开。
             - ``max_waveforms_html``：每个 Unit 的 HTML 最多绘制多少条波形，
-              默认 2000。
+            默认 2000。
             - ``max_waveforms_png``：每个 Unit 的 PNG 最多绘制多少条波形，
-              默认 2000。
+            默认 2000。
             - ``max_waveforms_group``：每个 Unit 在 group waveform 和 group PCA
-              HTML 中最多绘制多少条波形/投影点，默认 2000。
+            HTML 中最多绘制多少条波形/投影点，默认 2000。
             ``sorting_params``、``extensions_dict`` 和 ``preprocess_pipeline_dict``
             可分别通过 ``get_all_sorting_params_dict()``、
             ``get_all_extensions_params_dict()`` 和
@@ -2390,21 +2393,21 @@ class _PipelineRunnerMixin:
             字典中的字段如下：
 
             - ``traces`` (np.ndarray)：神经信号数据，形状为
-              ``(n_samples, n_channels)``；默认单位为 μV，该单位会影响后续阈值、
-              去噪和波形绘图。
+            ``(n_samples, n_channels)``；默认单位为 μV，该单位会影响后续阈值、
+            去噪和波形绘图。
             - ``fs`` (float)：采样频率，单位 Hz。
             - ``chan_ids`` (list)：通道 ID 列表，长度必须等于 ``n_channels``。
             - ``metadata_folder`` (str | Path | None)：可选的元数据文件夹，包含
-              通道增益等 Recording 元数据。
+            通道增益等 Recording 元数据。
             - ``properties`` (dict | None)：可选的 Recording 属性字典，例如 LSB
-              等信号处理属性。
+            等信号处理属性。
             如果 ``traces_config`` 为 None，则从 ``self.input_file`` 指向的 PLX 文件读取。
         n_jobs : int, default: -1
             支持并行的步骤所使用的任务数；-1 表示使用全部可用核心。
-        run_until_step : int | str | None, default: 7
-            控制管道运行到哪个步骤后停止。可以传 1～8，也可以传下面列出的
-            英文步骤名。默认运行到步骤 7（导出 Phy），不会自动启动 CellExplorer；
-            传入 8 或 ``"cell_explorer"`` 才会继续执行 CellExplorer。
+        run_step : list[int], default: [1, 2, 3, 4, 5, 6]
+            只运行列表中指定的步骤。例如 ``[2, 3, 6, 7]`` 只运行步骤 2、3、6、7。
+        overwrite: bool, default: True
+            是否覆写对应的文件夹，默认为True时在各步骤会先删除过去的文件夹再创建新的文件夹。
 
         Returns
         -------
@@ -2419,57 +2422,18 @@ class _PipelineRunnerMixin:
         5. ``renew_unit_type``：质量筛选并可选推断细胞类型。
         6. ``visualize``：生成 waveform、自相关和 group 汇总 HTML/PNG。
         7. ``export_to_phy``：导出 Phy 文件。
-        8. ``cell_explorer``：在 ``run_until_step=8`` 且 MATLAB Engine 可用时运行。
+        8. ``cell_explorer``：在 ``run_step`` 包含 8 且 MATLAB Engine 可用时运行。
 
         Notes
         -----
-        ``run_until_step`` 只控制“在哪里停止”，不会跳过前面的步骤。例如传入
-        4 会依次完成步骤 1～4，然后返回。CellExplorer 还需要 MATLAB Engine 可用。
+        ``run_step`` 只运行列表中指定的步骤，不会自动运行未列出的步骤。
+        例如传入 ``[2, 3, 6, 7]`` 时只运行步骤 2、3、6、7。CellExplorer 还需要
+        MATLAB Engine 可用。
         """
         if config is None:
             config = {}
         if traces_config is None:
             traces_config = {}
-
-        step_names = {
-            1: "save_recording",
-            2: "preprocess",
-            3: "sorting",
-            4: "create_analyzer",
-            5: "renew_unit_type",
-            6: "visualize",
-            7: "export_to_phy",
-            8: "cell_explorer",
-        }
-        step_numbers = {name: number for number, name in step_names.items()}
-
-        # run_until_step 只从函数参数传入，不再从 config 读取。
-        requested_step = 7 if run_until_step is None else run_until_step
-
-        if isinstance(requested_step, str):
-            normalized_step = requested_step.strip().lower()
-            if normalized_step not in step_numbers:
-                raise ValueError(
-                    "run_until_step 必须是 1～8，或以下步骤名之一："
-                    f"{list(step_numbers)}"
-                )
-            final_step = step_numbers[normalized_step]
-        elif isinstance(requested_step, int) and not isinstance(requested_step, bool):
-            if requested_step not in step_names:
-                raise ValueError("run_until_step 必须是 1～8 之间的整数")
-            final_step = requested_step
-        else:
-            raise TypeError("run_until_step 必须是 int、str 或 None")
-
-        def stop_after(step_number):
-            """完成用户指定的最后一步后打印提示并返回停止标记。"""
-            if final_step == step_number:
-                print(
-                    f"已完成步骤 {step_number}/8 "
-                    f"({step_names[step_number]})，按 run_until_step 设置停止。"
-                )
-                return True
-            return False
 
         # 集中读取配置，使下方每个步骤只保留实际执行逻辑。
         sorter_name = config.get("sorter_name", "mountainsort5")
@@ -2487,119 +2451,147 @@ class _PipelineRunnerMixin:
         # 仍可通过其 group_n_jobs 参数自行控制 joblib 并行数。
         group_n_jobs = 1
 
-        print(f"本次管道计划运行到步骤 {final_step}/8 ({step_names[final_step]})。")
+        print(f"本次管道计划运行步骤：{run_step}。")
+        import time
+        t_strat = time.time()
 
-        print("步骤 1/8：创建并保存原始 Recording...")
-        if traces_config:
-            self.save_traces_to_recording_file(
-                traces_config.get("traces"),
-                traces_config.get("fs"),
-                traces_config.get("chan_ids"),
-                self.output_paths.raw_recording_folder,
-                traces_config.get("metadata_folder"),
-                traces_config.get("properties"),
-                probe=probe,
-                n_jobs=1,
-            )
-        else:
-            self.read_save_plx_file(
-                self.input_file,
-                self.output_paths.raw_recording_folder,
-                probe=probe,
-                n_jobs=n_jobs,
-            )
-        if stop_after(1):
-            return
-
-        print("步骤 2/8：应用预处理 Pipeline...")
-        self.preprocess_recording(
-            self.output_paths.raw_recording_folder,
-            self.output_paths.preprocessed_recording_folder,
-            n_jobs=n_jobs,
-            preprocess_pipeline_dict=preprocess_pipeline_dict,
-        )
-        if stop_after(2):
-            return
-
-        print("步骤 3/8：执行 spike sorting...")
-        try:
-            sorting = self.perform_sorting(
-                self.output_paths.preprocessed_recording_folder,
-                sorter_name,
-                self.output_paths.sorting_object_folder,
-                sorting_params,
-                run_in_docker=run_in_docker,
-                group_n_jobs=group_n_jobs,
-            )
-        except Exception as exc:
-            print(f"步骤 3 sorting 失败：{exc}")
-            print("当前 setting 已停止，跳过 Analyzer、扩展计算和后续步骤。")
-            return
-
-        # 某些 group 可能没有任何 spike。此时 perform_sorting() 会返回空
-        # NumpySorting；不要将空 sorting 交给 Analyzer，以免扩展内部对空数组
-        # 调用 np.concatenate([]) 而再次报错。
-        if sorting is None or len(sorting.unit_ids) == 0:
-            print("步骤 3 完成，但没有任何有效 Unit。")
-            print("跳过 Analyzer、质量指标、可视化、Phy 和 CellExplorer。")
-            return
-
-        if stop_after(3):
-            return
-
-        try:
-            print("步骤 4/8：创建 SortingAnalyzer 并计算 extensions...")
-            self.create_analyzer(
-                self.output_paths.preprocessed_recording_folder,
-                self.output_paths.sorting_object_folder,
-                self.output_paths.sorting_analyzer_folder,
-                extensions_dict=extensions_dict,
-                compute=True,
-                template_metrics_path=self.output_paths.template_metrics_path,
-                qm_path=self.output_paths.qm_excel_path,
-                n_jobs=n_jobs,
-            )
-            if stop_after(4):
-                return
-
-            print("步骤 5/8：更新 Unit 质量和细胞类型结果...")
-            self.renew_unit_type(
-                self.output_paths.sorting_analyzer_folder,
-                self.output_paths.cell_type_metrics_path,
-            )
-            if stop_after(5):
-                return
-
-            print("步骤 6/8：生成 waveform、自相关和 group 汇总图表...")
-            self.visualize_results(
-                self.output_paths.sorting_analyzer_folder,
-                fig_folder=self.output_paths.figures_folder / "waveform_figures",
-                max_waveforms_html=max_waveforms_html,
-                max_waveforms_png=max_waveforms_png,
-                max_waveforms_group=max_waveforms_group,
-            )
-            if stop_after(6):
-                return
-
-            print("步骤 7/8：导出 Phy 文件...")
-            self.export_to_phy(
-                self.output_paths.sorting_analyzer_folder,
-                self.output_paths.phy_folder,
-            )
-            if stop_after(7):
-                return
-
-            print("步骤 8/8：检查并运行 CellExplorer...")
-            if not self._matlab_available:
-                print("MATLAB Engine 不可用，跳过 CellExplorer。")
-            else:
-                self.run_cell_explorer(
-                    self.output_paths.phy_folder,
-                    self.matlab_func_path,
-                    self.output_paths.cell_metrics_path,
+        if 1 in run_step:
+            print("步骤 1/8：创建并保存原始 Recording...")
+            t_step = time.time()
+            if traces_config:
+                if overwrite:
+                    shutil.rmtree(self.output_paths.raw_recording_folder, ignore_errors=True)
+                self.save_traces_to_recording_file(
+                    traces_config.get("traces"),
+                    traces_config.get("fs"),
+                    traces_config.get("chan_ids"),
+                    self.output_paths.raw_recording_folder,
+                    traces_config.get("metadata_folder"),
+                    traces_config.get("properties"),
+                    probe=probe,
+                    n_jobs=1,
                 )
+            else:
+                if overwrite:
+                    shutil.rmtree(self.output_paths.raw_recording_folder, ignore_errors=True)
+                self.read_save_plx_file(
+                    self.input_file,
+                    self.output_paths.raw_recording_folder,
+                    probe=probe,
+                    n_jobs=n_jobs,
+                )
+            print(f"步骤1结束，共耗时：{time.time()-t_step}秒")
+        if 2 in run_step:
+            print("步骤 2/8：应用预处理 Pipeline...")
+            t_step = time.time()
+            if overwrite:
+                shutil.rmtree(self.output_paths.preprocessed_recording_folder, ignore_errors=True)
+            self.preprocess_recording(
+                self.output_paths.raw_recording_folder,
+                self.output_paths.preprocessed_recording_folder,
+                n_jobs=n_jobs,
+                preprocess_pipeline_dict=preprocess_pipeline_dict,
+            )
+            print(f"步骤2结束，共耗时：{time.time()-t_step}秒")
+        if 3 in run_step:
+            print("步骤 3/8：执行 spike sorting...")
+            t_step = time.time()
+            try:
+                if overwrite:
+                    shutil.rmtree(self.output_paths.sorting_object_folder, ignore_errors=True)
+                sorting = self.perform_sorting(
+                    self.output_paths.preprocessed_recording_folder,
+                    self.output_paths.cache_folder,
+                    sorter_name,
+                    self.output_paths.sorting_object_folder,
+                    sorting_params,
+                    run_in_docker=run_in_docker,
+                    group_n_jobs=group_n_jobs,
+                )
+                print(f"步骤3结束，共耗时：{time.time()-t_step}秒")
+            except Exception as exc:
+                print(f"步骤 3 sorting 失败：{exc}")
+                print("当前 setting 已停止，跳过 Analyzer、扩展计算和后续步骤。")
+                return
 
-            print("管道执行完成！")
+            # 某些 group 可能没有任何 spike。此时 perform_sorting() 会返回空
+            # NumpySorting；不要将空 sorting 交给 Analyzer，以免扩展内部对空数组
+            # 调用 np.concatenate([]) 而再次报错。
+            if sorting is None or len(sorting.unit_ids) == 0:
+                print("步骤 3 完成，但没有任何有效 Unit。")
+                print("跳过 Analyzer、质量指标、可视化、Phy 和 CellExplorer。")
+                return
+
+        try:
+            if 4 in run_step:
+                print("步骤 4/8：创建 SortingAnalyzer 并计算 extensions...")
+                t_step = time.time()
+                if overwrite:
+                    shutil.rmtree(self.output_paths.sorting_analyzer_folder, ignore_errors=True)
+                    shutil.rmtree(self.output_paths.template_metrics_path, ignore_errors=True)
+                    shutil.rmtree(self.output_paths.qm_excel_path, ignore_errors=True)
+                self.create_analyzer(
+                    self.output_paths.preprocessed_recording_folder,
+                    self.output_paths.sorting_object_folder,
+                    self.output_paths.sorting_analyzer_folder,
+                    extensions_dict=extensions_dict,
+                    compute=True,
+                    template_metrics_path=self.output_paths.template_metrics_path,
+                    qm_path=self.output_paths.qm_excel_path,
+                    n_jobs=n_jobs,
+                )
+                print(f"步骤4结束，共耗时：{time.time()-t_step}秒")
+            if 5 in run_step:
+                print("步骤 5/8：更新 Unit 质量和细胞类型结果...")
+                t_step = time.time()
+                if overwrite:
+                    shutil.rmtree(self.output_paths.cell_type_metrics_path, ignore_errors=True)
+                self.renew_unit_type(
+                    self.output_paths.sorting_analyzer_folder,
+                    self.output_paths.cell_type_metrics_path,
+                )
+                print(f"步骤5结束，共耗时：{time.time()-t_step}秒")
+            if 6 in run_step:
+                print("步骤 6/8：生成 waveform、自相关和 group 汇总图表...")
+                t_step = time.time()
+                if overwrite:
+                    shutil.rmtree(self.output_paths.figures_folder / "waveform_figures", ignore_errors=True)
+                self.visualize_results(
+                    self.output_paths.sorting_analyzer_folder,
+                    fig_folder=self.output_paths.figures_folder / "waveform_figures",
+                    max_waveforms_html=max_waveforms_html,
+                    max_waveforms_png=max_waveforms_png,
+                    max_waveforms_group=max_waveforms_group,
+                )
+                print(f"步骤6结束，共耗时：{time.time()-t_step}秒")
+            if 7 in run_step:
+                print("步骤 7/8：导出 Phy 文件...")
+                t_step = time.time()
+                if overwrite:
+                    shutil.rmtree(self.output_paths.phy_folder, ignore_errors=True)
+                self.export_to_phy(
+                    self.output_paths.sorting_analyzer_folder,
+                    self.output_paths.phy_folder,
+                )
+                print(f"步骤7结束，共耗时：{time.time()-t_step}秒")
+            if 8 in run_step:
+                print("步骤 8/8：检查并运行 CellExplorer...")
+                t_step = time.time()
+                if overwrite:
+                    shutil.rmtree(self.output_paths.cell_metrics_path, ignore_errors=True)
+                if not self._matlab_available:
+                    print("MATLAB Engine 不可用，跳过 CellExplorer。")
+                else:
+                    self.run_cell_explorer(
+                        self.output_paths.phy_folder,
+                        self.matlab_func_path,
+                        self.output_paths.cell_metrics_path,
+                    )
+                print(f"步骤8结束，共耗时：{time.time()-t_step}秒")
+
+
+
+            print(f"管道执行完成！共耗时{time.time()-t_strat}秒")
 
         except ValueError as exc:
             if "need at least one array to concatenate" in str(exc):

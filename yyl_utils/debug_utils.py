@@ -11,6 +11,43 @@ from pathlib import Path
 from typing import Optional, Union, Callable
 import time
 
+
+def print_dir(dir_path: Union[str, Path], print_subdir: bool = True, pattern: Union[str, None] = None):
+    """
+    打印目录内容，支持通配符过滤
+
+    Args:
+        dir_path: 目标目录路径
+        print_subdir: True=遍历所有子目录，False=仅当前目录
+        pattern: 通配符模式（如 "*.txt", "*.py"），None=所有内容
+    """
+    from pathlib import Path
+    dir_path = Path(dir_path)
+
+    if print_subdir:
+        # 递归遍历所有子目录
+        if pattern:
+            # 匹配指定模式的文件（只返回文件，排除目录本身）
+            for item in dir_path.rglob(pattern):
+                if item.is_file():
+                    print(str(item))
+        else:
+            # 递归获取所有文件（排除目录）
+            for item in dir_path.rglob("*"):
+                if item.is_file():
+                    print(str(item))
+    else:
+        # 仅遍历当前目录
+        if pattern:
+            for item in dir_path.glob(pattern):
+                if item.is_file():
+                    print(str(item))
+        else:
+            for item in dir_path.glob("*"):
+                if item.is_file():
+                    print(str(item))
+
+
 def get_full_size(obj):
     """
     使用 pympler 库的 asizeof 函数，递归计算对象及其所有引用对象的总内存占用。

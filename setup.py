@@ -7,6 +7,14 @@ setup(
     author="Apologies-to-my-book",
     author_email="yyl1216466507@gmail.com",
     packages=find_packages(),
+
+    package_data={
+        "yyl_utils": [
+            "*.pyi",
+            "py.typed",
+        ],
+    },
+    include_package_data=True,
     # 只放必要的核心依赖
     install_requires=[
         "numpy>=1.18.0",

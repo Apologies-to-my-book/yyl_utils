@@ -888,9 +888,11 @@ class RippleDetector:
         return data_gauss_envelope
 
     @staticmethod
-    def plot_html(lfp, envelope, figure_width, num_waveforms, threshold_high_sd, threshold_low_sd,
-                  htmlTotalPath:Path, file_name:str,
-                  epoches_ripple):
+    def plot_html(epochs_ripple, lfp, htmlTotalPath:Path,
+                   envelope=None,threshold_high_sd=None, threshold_low_sd=None,
+                  figure_width=200, num_waveforms=500, file_name:str="ripple_figures",
+                   
+                  ):
         """
         生成交互式的脑电波纹(Ripple)检测结果可视化HTML图表
 
@@ -902,7 +904,7 @@ class RippleDetector:
             threshold_low_sd: 低阈值标准差值
             htmlTotalPath: HTML文件保存路径
             file_name: 输出文件的基础名称
-            epoches_ripple: 检测到的波纹事件时段列表，每个元素为[start, end]格式
+            epochs_ripple: 检测到的波纹事件时段列表，每个元素为[start, end]格式
         """
         import os
         import gc
@@ -1037,11 +1039,17 @@ class RippleDetector:
         threshold_high_sd_line_row = []  # 存储高阈值线数据
         threshold_low_sd_line_row = []  # 存储低阈值线数据
 
+        envelope = np.zeros_like(lfp) if envelope is None else envelope
+        threshold_high_sd = np.zeros_like(lfp) if threshold_high_sd is None else threshold_high_sd
+        threshold_low_sd = np.zeros_like(lfp) if threshold_low_sd is None else threshold_low_sd
+
+
+
         # 对数据进行填充，确保波纹事件前后有足够的显示范围
         lfp_value_padded = np.pad(lfp, (figure_width, figure_width), mode='constant', constant_values=0)
         envelope_padded = np.pad(envelope, (figure_width, figure_width), mode='constant', constant_values=0)
         threshold_high_sd_padded = np.pad(
-            threshold_high_sd, (figure_width, figure_width), mode='constant', constant_values=0)
+            threshold_high_sd,(figure_width, figure_width),mode="constant",constant_values=0,)
         threshold_low_sd_padded = np.pad(
             threshold_low_sd, (figure_width, figure_width), mode='constant', constant_values=0)
 
@@ -1049,7 +1057,7 @@ class RippleDetector:
         output_file_name = os.path.join(htmlTotalPath, file_name + '_0.html')
 
         # 遍历所有检测到的波纹事件
-        for n1, item in enumerate(epoches_ripple):
+        for n1, item in enumerate(epochs_ripple):
             # 提取当前波纹事件及其前后扩展区域的数据
             epoch = lfp_value_padded[item[0]:item[1] + 2 * figure_width]
             envelope_epoch = envelope_padded[item[0]:item[1] + 2 * figure_width]
@@ -1057,14 +1065,14 @@ class RippleDetector:
             threshold_low_sd_epoch = threshold_low_sd_padded[item[0]:item[1] + 2 * figure_width]
 
             # 如果不是最后一个事件
-            if (n1 + 1) != len(epoches_ripple):
+            if (n1 + 1) != len(epochs_ripple):
                 # 每处理num_waveforms个事件就生成一个HTML文件
                 if (n1 + 1) % num_waveforms == 0:
                     create_interactive_ripple_plot_with_lines(
                         ripple_line_row, axv_idx_row, evnelope_line_row,
                         threshold_high_sd_line_row, threshold_low_sd_line_row,
                         output_file=output_file_name)
-                    print(f"作图中，正进行第{(n1 + 1)}/{len(epoches_ripple)}个")
+                    print(f"作图中，正进行第{(n1 + 1)}/{len(epochs_ripple)}个")
 
                     # 重置数据列表，开始新的一批数据处理
                     ripple_line_row = []
@@ -1092,7 +1100,7 @@ class RippleDetector:
                     axv_idx_row.append(len(ripple_line_row) - 1)  # 记录当前事件的结束位置
 
             # 处理最后一个事件
-            if (n1 + 1) == len(epoches_ripple):
+            if (n1 + 1) == len(epochs_ripple):
                 create_interactive_ripple_plot_with_lines(
                     ripple_line_row, axv_idx_row, evnelope_line_row,
                     threshold_high_sd_line_row, threshold_low_sd_line_row,
@@ -1158,7 +1166,7 @@ class RippleDetector:
             # 此处的所有涉及到的时间都是以采样点数计算，而不是现实时间。
         :param envelope_values: 根据包络序列计算ripple时间,
         notched_lfp：notch后的lfp，用于硬阈值去噪
-        :return: epoches_ripple：ripple的起止时间,
+        :return: epochs_ripple：ripple的起止时间,
                 threshold_high_sd：高阈值序列(用于画图), threshold_low_sd：低阈值序列(用于画图), z_score_line：Z线(用于画图)
         """
         import numpy as np
@@ -1293,16 +1301,16 @@ class RippleDetector:
         if self.hard_wrong_dots_threshold :
             # 去除notch后lfp中的值超过self.hard_wrong_dots_threshold的点
             epoch_screened = delete_wrong_dots(epoch_screened, notched_lfp, self.hard_wrong_dots_threshold)
-        epoches_ripple = epoch_screened
+        epochs_ripple = epoch_screened
         # 对ripple事件按时间排序
-        epoches_ripple = sorted(epoches_ripple, key=lambda x: x[0])
-        epoches_ripple = np.array(epoches_ripple)
-        print(f'检测结束，共检测到{len(epoches_ripple)}个符合条件的波形')
-        return epoches_ripple, threshold_high_sd, threshold_low_sd, z_score_line
+        epochs_ripple = sorted(epochs_ripple, key=lambda x: x[0])
+        epochs_ripple = np.array(epochs_ripple)
+        print(f'检测结束，共检测到{len(epochs_ripple)}个符合条件的波形')
+        return epochs_ripple, threshold_high_sd, threshold_low_sd, z_score_line
 
     def total_pipeline(self,lfp:np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         """
-        输入的是用于计算的lfp，输出的是epoches_ripple, envelope_lfp, threshold_high_sd, threshold_low_sd, z_score_line,分别是
+        输入的是用于计算的lfp，输出的是epochs_ripple, envelope_lfp, threshold_high_sd, threshold_low_sd, z_score_line,分别是
         ripple发作时间(是一个n行2列的矩阵，矩阵的每行是[开始时间，结束时间])，lfp的包络线，
         用于作图的整个时段的高阈值线、低阈值线，滤波后lfp的幅值包络的z线
         :param lfp:
@@ -1311,9 +1319,9 @@ class RippleDetector:
         notched_lfp=self.my_notchfilter(lfp)
         bandpassed_lfp=self.mybandpassfilter(notched_lfp)
         envelope_lfp=self.calc_gauss_envelope(bandpassed_lfp)
-        epoches_ripple, threshold_high_sd, threshold_low_sd, z_score_line=self.get_ripple_time(envelope_lfp, notched_lfp)
+        epochs_ripple, threshold_high_sd, threshold_low_sd, z_score_line=self.get_ripple_time(envelope_lfp, notched_lfp)
         # 画html图
-        if (self.is_plot==True) & (len(epoches_ripple) != 0):
-            self.plot_html(notched_lfp,envelope_lfp,self.figure_width,self.figure_num_waveforms, threshold_high_sd,
-                           threshold_low_sd,self.html_path,self.figure_name,epoches_ripple)
-        return epoches_ripple, envelope_lfp, bandpassed_lfp, threshold_high_sd, threshold_low_sd, z_score_line,
+        if (self.is_plot==True) & (len(epochs_ripple) != 0):
+            self.plot_html(epochs_ripple,notched_lfp,self.html_path,envelope_lfp,threshold_high_sd,
+                           threshold_low_sd,self.figure_width,self.figure_num_waveforms,self.figure_name,)
+        return epochs_ripple, envelope_lfp, bandpassed_lfp, threshold_high_sd, threshold_low_sd, z_score_line,
